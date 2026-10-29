@@ -5,9 +5,9 @@
  * yuklenmis paketleri goster, guncellemeleri kontrol eder ve GnuChan
  * X11 programlarini otomatik olarak gunceller.
  *
- * Her baslatisida GitHub'daki tum GnuChan depolarindaki version.txt'lari
- * kontrol eder, kurulu programların config dosyasindaki versiyonla
- * karsilastirir ve guncelleme gorunsun diye isaretler.
+ * Kurulu GnuChan programlarinin GitHub version.txt dosyalarini yerel
+ * config versiyonlariyla karsilastirir. Paket taramasi ve guncelleme
+ * denetimleri arayuz acildiktan sonra arka planda yapilir.
  *
  * Islevler:
  *   - Butun Debian paketlerini tarama (dpkg-query)
@@ -25,6 +25,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <pwd.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -151,6 +152,13 @@ static int show_installed_by_default = 1;
 static int check_updates_on_start = 1;
 static int require_authentication = 1;
 static int update_checks_disabled = 0;
+static int loading_packages = 1;
+static int checking_updates = 0;
+static unsigned long state_revision = 0;
+static pthread_mutex_t state_mutex;
+static Pixmap back_buffer = None;
+static int back_buffer_width = 0;
+static int back_buffer_height = 0;
 
 static volatile sig_atomic_t should_stop = 0;
 
@@ -308,14 +316,23 @@ static void check_github_versions(const char *home);
 
 static void refresh_update_checks(const char *home) {
     if (!check_updates_on_start) {
+        pthread_mutex_lock(&state_mutex);
         update_checks_disabled = 1;
         github_check_done = 1;
         update_available = 0;
         gnuchan_update_count = 0;
         set_status("Automatic update checks are disabled in settings");
+        checking_updates = 0;
+        state_revision++;
+        pthread_mutex_unlock(&state_mutex);
         return;
     }
+    pthread_mutex_lock(&state_mutex);
     update_checks_disabled = 0;
+    checking_updates = 1;
+    github_check_done = 0;
+    state_revision++;
+    pthread_mutex_unlock(&state_mutex);
     check_apt_updates();
     check_github_versions(home);
 }
@@ -410,7 +427,7 @@ static void pkg_add(const char *name, const char *version,
                     const char *desc, PkgState state,
                     PackageCategory category,
                     int is_gnuchan, int has_update, int github_update) {
-    if (pkg_find(name)) return;
+    if (pkg_find(name) || pkg_count >= MAX_PACKAGES) return;
     Package *p = calloc(1, sizeof(*p));
     if (!p) return;
     snprintf(p->name, sizeof(p->name), "%s", name);
@@ -460,35 +477,41 @@ static PackageCategory category_for_section(const char *section) {
 }
 
 static void load_installed_packages(void) {
-    char cmd[CMD_BUF_LEN];
-    snprintf(cmd, sizeof(cmd),
-             "dpkg-query -W -f='${Package}\\t${Version}\\t${db:Status-Status}\\t${Section}\\n' 2>/dev/null");
-    char out[CMD_BUF_LEN * 4];
-    if (run_cmd(cmd, out, sizeof(out)) != 0) {
-        set_status("dpkg-query calismadi");
+    const char *cmd =
+        "dpkg-query -W -f='${Package}\\t${Version}\\t${db:Status-Status}\\t${Section}\\n' 2>/dev/null";
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        pthread_mutex_lock(&state_mutex);
+        set_status("dpkg-query could not be started");
+        pthread_mutex_unlock(&state_mutex);
         return;
     }
 
-    char *line = out;
-    while (*line) {
-        char *end = strchr(line, '\n');
-        if (end) *end = '\0';
-
+    char line[LINE_BUF_LEN];
+    while (fgets(line, sizeof(line), fp)) {
         char name[MAX_NAME_LEN] = {0};
         char version[MAX_VERSION_LEN] = {0};
         char status[32] = {0};
         char section[128] = {0};
-        sscanf(line, "%255[^\t]\t%63[^\t]\t%31[^\t]\t%127[^\n]",
-               name, version, status, section);
+        if (sscanf(line, "%255[^\t]\t%63[^\t]\t%31[^\t]\t%127[^\n]",
+                   name, version, status, section) < 3 || !name[0]) {
+            continue;
+        }
 
         int installed = strcmp(status, "installed") == 0;
         int is_gc = is_gnuchan_binary(name);
+        pthread_mutex_lock(&state_mutex);
         pkg_add(name, version, "",
                 installed ? PKG_STATE_INSTALLED : PKG_STATE_NOT_INSTALLED,
                 category_for_section(section), is_gc, 0, 0);
+        pthread_mutex_unlock(&state_mutex);
+    }
 
-        if (end) line = end + 1;
-        else break;
+    int rc = pclose(fp);
+    if (!WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
+        pthread_mutex_lock(&state_mutex);
+        set_status("dpkg-query failed");
+        pthread_mutex_unlock(&state_mutex);
     }
 }
 
@@ -498,11 +521,14 @@ static void check_apt_updates(void) {
     snprintf(cmd, sizeof(cmd), "apt-get -s upgrade 2>/dev/null | grep '^Inst' | head -50");
     char out[CMD_BUF_LEN * 4];
     if (run_cmd(cmd, out, sizeof(out)) != 0) {
+        pthread_mutex_lock(&state_mutex);
         set_status("apt guncelleme denetimi calismadi");
+        pthread_mutex_unlock(&state_mutex);
         return;
     }
 
     int cnt = 0;
+    pthread_mutex_lock(&state_mutex);
     char *line = out;
     while (*line) {
         char *end = strchr(line, '\n');
@@ -518,19 +544,56 @@ static void check_apt_updates(void) {
         if (end) line = end + 1;
         else break;
     }
-    update_available = (cnt > 0);
+    update_available = cnt;
+    state_revision++;
+    pthread_mutex_unlock(&state_mutex);
 }
 
-/* GitHub'dan tum GnuChan repolarinin version.txt'ini al */
+static int repo_config_exists(const char *home, const GnuchanRepo *repo) {
+    char path[CONFIG_PATH_LEN];
+    snprintf(path, sizeof(path), "%s/.config/%s/%s", home,
+             repo->config_dir, repo->config_file);
+    return access(path, R_OK) == 0;
+}
+
+static void add_user_gnuchan_programs(const char *home) {
+    pthread_mutex_lock(&state_mutex);
+    for (size_t i = 0; i < GNUCHAN_REPO_COUNT; i++) {
+        GnuchanRepo *repo = &gnuchan_repos[i];
+        if (!repo_config_exists(home, repo)) continue;
+        read_config_version(home, repo->config_dir, repo->config_file,
+                            repo->local_version, sizeof(repo->local_version));
+        Package *pkg = pkg_find(repo->program);
+        if (pkg) {
+            pkg->state = PKG_STATE_INSTALLED;
+            pkg->is_gnuchan = 1;
+            snprintf(pkg->version, sizeof(pkg->version), "%s",
+                     repo->local_version);
+        } else {
+            pkg_add(repo->program, repo->local_version, "GnuChan program",
+                    PKG_STATE_INSTALLED, CATEGORY_OTHER, 1, 0, 0);
+        }
+    }
+    pthread_mutex_unlock(&state_mutex);
+}
+
+/* Check GitHub versions for the GnuChan programs installed for this user. */
 static void check_github_versions(const char *home) {
-    github_check_failures = 0;
+    int failures = 0;
+    int checked = 0;
     for (size_t i = 0; i < GNUCHAN_REPO_COUNT; i++) {
         GnuchanRepo *r = &gnuchan_repos[i];
         r->has_remote = 0;
         r->update_available = 0;
         r->remote_version[0] = '\0';
 
-        /* Yerel versiyonu config dosyasindan oku */
+        /* Only check programs installed for this user. */
+        if (!repo_config_exists(home, r)) {
+            snprintf(r->local_version, sizeof(r->local_version), "0.0.0");
+            continue;
+        }
+        checked++;
+
         read_config_version(home, r->config_dir, r->config_file,
                             r->local_version, sizeof(r->local_version));
 
@@ -539,7 +602,9 @@ static void check_github_versions(const char *home) {
         snprintf(url, sizeof(url),
                  "https://raw.githubusercontent.com/gnuchanos/%s/main/version.txt", r->repo);
         char cmd[CMD_BUF_LEN];
-        snprintf(cmd, sizeof(cmd), "curl -fsS --connect-timeout 5 '%s' 2>/dev/null", url);
+        snprintf(cmd, sizeof(cmd),
+                 "curl -fsS --connect-timeout 3 --max-time 8 '%s' 2>/dev/null",
+                 url);
         char out[CMD_BUF_LEN];
         if (run_cmd(cmd, out, sizeof(out)) == 0 && out[0]) {
             /* Bosluklari temizle */
@@ -557,41 +622,61 @@ static void check_github_versions(const char *home) {
                     r->update_available = 1;
                 }
             } else {
-                github_check_failures++;
+                failures++;
             }
         } else {
-            github_check_failures++;
+            failures++;
         }
     }
 
-    /* GnuChan guncelleme sayisi */
+    pthread_mutex_lock(&state_mutex);
+    github_check_failures = failures;
     gnuchan_update_count = 0;
     for (size_t i = 0; i < GNUCHAN_REPO_COUNT; i++) {
         if (gnuchan_repos[i].update_available) gnuchan_update_count++;
     }
     github_check_done = 1;
     if (github_check_failures > 0) {
-        set_status_fmt("GitHub update check incomplete: %d of %lu repositories unavailable",
+        set_status_fmt("GitHub check incomplete: %d of %d installed GnuChan program(s) unavailable",
                        github_check_failures,
-                       (unsigned long)GNUCHAN_REPO_COUNT);
+                       checked);
     } else {
-        set_status_fmt("GitHub checked %lu repositories; %d GnuChan update(s)",
-                       (unsigned long)GNUCHAN_REPO_COUNT,
+        set_status_fmt("GitHub checked %d installed GnuChan program(s); %d update(s)",
+                       checked,
                        gnuchan_update_count);
     }
 
-    /* Paket listesindeki GnuChan entry'leri guncelle */
+    /* Include user-installed GnuChan programs even when they are not dpkg packages. */
     for (size_t i = 0; i < GNUCHAN_REPO_COUNT; i++) {
+        if (!repo_config_exists(home, &gnuchan_repos[i])) continue;
         Package *p = pkg_find(gnuchan_repos[i].program);
         if (p) {
+            p->state = PKG_STATE_INSTALLED;
+            p->is_gnuchan = 1;
+            snprintf(p->version, sizeof(p->version), "%s",
+                     gnuchan_repos[i].local_version);
             snprintf(p->remote_version, sizeof(p->remote_version), "%s",
                      gnuchan_repos[i].remote_version);
             p->github_update = gnuchan_repos[i].update_available;
             if (gnuchan_repos[i].update_available) {
                 p->has_update = 1;
             }
+        } else {
+            pkg_add(gnuchan_repos[i].program,
+                    gnuchan_repos[i].local_version,
+                    "GnuChan program", PKG_STATE_INSTALLED, CATEGORY_OTHER,
+                    1, gnuchan_repos[i].update_available,
+                    gnuchan_repos[i].update_available);
+            p = pkg_find(gnuchan_repos[i].program);
+            if (p) {
+                snprintf(p->remote_version, sizeof(p->remote_version), "%s",
+                         gnuchan_repos[i].remote_version);
+            }
         }
     }
+    checking_updates = 0;
+    state_revision++;
+    pthread_mutex_unlock(&state_mutex);
 }
 
 /* --- paket islemleri ----------------------------------------------------- */
@@ -848,8 +933,9 @@ static void draw_sidebar(Display *dpy, Window win, GC gc) {
             fill_rect(dpy, win, gc, get_color(dpy, COL_SELECT),
                       4, yy - 4, (unsigned int)(SIDEBAR_W - 8), (unsigned int)item_h);
         }
-        draw_text(dpy, win, gc, get_color(dpy, COL_TEXT),
-                  14, yy, sidebar_items[i].label);
+        draw_text(dpy, win, gc,
+                  get_color(dpy, sel ? 0xFFFFFFU : COL_TEXT_DIM),
+                  14, yy + 16, sidebar_items[i].label);
 
         /* hint */
         char hint[64] = {0};
@@ -860,7 +946,7 @@ static void draw_sidebar(Display *dpy, Window win, GC gc) {
         }
         if (hint[0]) {
             draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM),
-                      SIDEBAR_W - 10 - (int)(strlen(hint) * 6), yy, hint);
+                      SIDEBAR_W - 10 - (int)(strlen(hint) * 6), yy + 16, hint);
         }
         yy += item_h;
     }
@@ -878,6 +964,15 @@ static void draw_header(Display *dpy, Window win, GC gc) {
               0, (unsigned int)HEADER_H, (unsigned int)WIN_WIDTH, 1);
 
     const char *title = "GnuChanSoftwareCenter";
+    for (int i = 0; i < sidebar_count; i++) {
+        if (current_view == sidebar_items[i].view) {
+            static char view_title[96];
+            snprintf(view_title, sizeof(view_title),
+                     "GnuChanSoftwareCenter - %s", sidebar_items[i].label);
+            title = view_title;
+            break;
+        }
+    }
     draw_text(dpy, win, gc, get_color(dpy, COL_TEXT), 14, HEADER_H / 2 + 6, title);
 
     int sx = WIN_WIDTH - 300;
@@ -890,6 +985,11 @@ static void draw_header(Display *dpy, Window win, GC gc) {
 }
 
 static void draw_package_list(Display *dpy, Window win, GC gc) {
+    if (loading_packages) {
+        draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM),
+                  LIST_LEFT, LIST_TOP + 20, "Scanning installed packages...");
+        return;
+    }
     int yy = LIST_TOP - scroll_offset * ITEM_H;
 
     for (int i = 0; i < visible_len; i++) {
@@ -940,7 +1040,10 @@ static void draw_package_list(Display *dpy, Window win, GC gc) {
 
     if (visible_len == 0) {
         draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM),
-                  LIST_LEFT, LIST_TOP, "gosterilecek paket yok");
+                  LIST_LEFT, LIST_TOP,
+                  current_view == VIEW_GNUCHAN
+                      ? "No installed GnuChan programs found"
+                      : "No packages match this view");
     }
 }
 
@@ -1011,11 +1114,17 @@ static void draw_footer(Display *dpy, Window win, GC gc) {
                   bx, by, gc_w, bh);
         draw_text(dpy, win, gc, get_color(dpy, COL_BG),
                   bx + 8, by + 18, "GitHub Denetlenemedi");
+    } else if (loading_packages || checking_updates) {
+        fill_rect(dpy, win, gc, get_color(dpy, 0x392150U),
+                  bx, by, gc_w, bh);
+        draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM),
+                  bx + 8, by + 18,
+                  loading_packages ? "Loading packages..." : "Checking updates...");
     } else {
         fill_rect(dpy, win, gc, get_color(dpy, 0x392150U),
                   bx, by, gc_w, bh);
         draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM),
-                  bx + 8, by + 18, "GnuChan Denetleniyor...");
+                  bx + 8, by + 18, "GnuChan Guncel");
     }
 
     if (status_msg[0]) {
@@ -1025,11 +1134,24 @@ static void draw_footer(Display *dpy, Window win, GC gc) {
 }
 
 static void redraw(Display *dpy, Window win, GC gc) {
-    XClearWindow(dpy, win);
-    draw_sidebar(dpy, win, gc);
-    draw_header(dpy, win, gc);
-    draw_package_list(dpy, win, gc);
-    draw_footer(dpy, win, gc);
+    if (back_buffer == None || back_buffer_width != WIN_WIDTH ||
+        back_buffer_height != WIN_HEIGHT) {
+        if (back_buffer != None) XFreePixmap(dpy, back_buffer);
+        back_buffer = XCreatePixmap(dpy, win, (unsigned int)WIN_WIDTH,
+                                    (unsigned int)WIN_HEIGHT,
+                                    (unsigned int)DefaultDepth(dpy,
+                                                               DefaultScreen(dpy)));
+        back_buffer_width = WIN_WIDTH;
+        back_buffer_height = WIN_HEIGHT;
+    }
+    fill_rect(dpy, back_buffer, gc, get_color(dpy, COL_BG), 0, 0,
+              (unsigned int)WIN_WIDTH, (unsigned int)WIN_HEIGHT);
+    draw_sidebar(dpy, back_buffer, gc);
+    draw_header(dpy, back_buffer, gc);
+    draw_package_list(dpy, back_buffer, gc);
+    draw_footer(dpy, back_buffer, gc);
+    XCopyArea(dpy, back_buffer, win, gc, 0, 0, (unsigned int)WIN_WIDTH,
+              (unsigned int)WIN_HEIGHT, 0, 0);
     XFlush(dpy);
 }
 
@@ -1061,6 +1183,7 @@ static void handle_keypress(Display *dpy, Window win, GC gc, XKeyEvent *ev) {
     }
 
     if (ks == XK_Return || ks == XK_KP_Enter) {
+        if (loading_packages || checking_updates) return;
         if (selected_index >= 0 && selected_index < visible_len) {
             Package *p = visible_list[selected_index].pkg;
             if (p->state == PKG_STATE_INSTALLED) {
@@ -1160,6 +1283,8 @@ static void handle_button(Display *dpy, Window win, GC gc, XButtonEvent *ev) {
         return;
     }
 
+    if (loading_packages || checking_updates) return;
+
     int fy = WIN_HEIGHT - FOOTER_H + 6;
     if (y >= fy && y < fy + 24) {
         Package *sel_pkg = (selected_index >= 0 && selected_index < visible_len)
@@ -1218,6 +1343,29 @@ static void handle_signal(int signum) {
     should_stop = 1;
 }
 
+static void *initial_load_worker(void *arg) {
+    const char *home = arg;
+    load_installed_packages();
+    add_user_gnuchan_programs(home);
+
+    pthread_mutex_lock(&state_mutex);
+    checking_updates = check_updates_on_start;
+    if (!check_updates_on_start) {
+        update_checks_disabled = 1;
+        github_check_done = 1;
+    }
+    loading_packages = 0;
+    set_status(check_updates_on_start
+                   ? "Packages loaded; checking for updates in the background"
+                   : "Packages loaded; automatic update checks are disabled");
+    rebuild_visible_list();
+    state_revision++;
+    pthread_mutex_unlock(&state_mutex);
+
+    refresh_update_checks(home);
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0) {
@@ -1228,12 +1376,27 @@ int main(int argc, char **argv) {
             printf("usage: GnuChanSoftwareCenter [--version] [--help]\n"
                    "\nGnuchanOS paket yoneticisi. Tum Debian paketlerini listeler,\n"
                    "guncellemeleri denetler ve GnuChan programlarini gunceller.\n"
-                   "Her baslatisida GitHub'dan GnuChan versiyonlarini kontrol eder.\n");
+                   "Kurulu GnuChan programlarinin surumlerini denetler.\n");
             return 0;
         }
     }
 
     gnuchan_lang_init();
+
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) {
+        home = "/root";
+    }
+    load_center_settings(home);
+    if (show_installed_by_default) {
+        current_view = VIEW_INSTALLED;
+    }
+
+    pthread_mutexattr_t mutex_attr;
+    pthread_mutexattr_init(&mutex_attr);
+    pthread_mutexattr_settype(&mutex_attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&state_mutex, &mutex_attr);
+    pthread_mutexattr_destroy(&mutex_attr);
 
     /* --- X11 pencere once acilir, arkaplan islemleri sonra ----------------- */
 
@@ -1263,8 +1426,7 @@ int main(int argc, char **argv) {
     XStoreName(dpy, win, "GnuChanSoftwareCenter");
     XFlush(dpy);
 
-    /* Wait for the first Expose event so the window is visible before we
-       block on network/dpkg calls. */
+    /* Wait for the first Expose event so the initial loading screen is visible. */
     XEvent ev;
     while (XPending(dpy) == 0) {
         struct timespec ts = {0, 10 * 1000 * 1000L};
@@ -1275,34 +1437,30 @@ int main(int argc, char **argv) {
     GC gc = create_gc(dpy, win);
     redraw(dpy, win, gc);
 
+    pthread_t loader_thread;
+    pthread_attr_t thread_attr;
+    pthread_attr_init(&thread_attr);
+    pthread_attr_setdetachstate(&thread_attr, PTHREAD_CREATE_DETACHED);
+    int thread_result = pthread_create(&loader_thread, &thread_attr,
+                                       initial_load_worker, (void *)home);
+    pthread_attr_destroy(&thread_attr);
+    if (thread_result != 0) {
+        initial_load_worker((void *)home);
+    }
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_signal;
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
 
-    /* --- paket veritabani ve GitHub versiyon denetimi ---------------------- */
-
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) {
-        home = "/root";
-    }
-
-    pkg_free_all();
-    load_installed_packages();
-    load_center_settings(home);
-    if (show_installed_by_default) {
-        current_view = VIEW_INSTALLED;
-    }
-
-    refresh_update_checks(home);
-
-    rebuild_visible_list();
-    redraw(dpy, win, gc);
-
+    pthread_mutex_lock(&state_mutex);
+    unsigned long drawn_revision = state_revision;
+    pthread_mutex_unlock(&state_mutex);
     while (!should_stop) {
         if (XPending(dpy) > 0) {
             XNextEvent(dpy, &ev);
+            pthread_mutex_lock(&state_mutex);
             switch (ev.type) {
             case Expose:
                 redraw(dpy, win, gc);
@@ -1325,15 +1483,23 @@ int main(int argc, char **argv) {
             default:
                 break;
             }
+            pthread_mutex_unlock(&state_mutex);
         } else {
             struct timespec ts = {0, 50 * 1000 * 1000L};
             nanosleep(&ts, NULL);
         }
+
+        pthread_mutex_lock(&state_mutex);
+        if (drawn_revision != state_revision) {
+            redraw(dpy, win, gc);
+            drawn_revision = state_revision;
+        }
+        pthread_mutex_unlock(&state_mutex);
     }
 
     XFreeGC(dpy, gc);
+    if (back_buffer != None) XFreePixmap(dpy, back_buffer);
     XDestroyWindow(dpy, win);
     XCloseDisplay(dpy);
-    pkg_free_all();
     return 0;
 }

@@ -169,7 +169,7 @@ def build() -> Path:
     cflags, libs = x11_flags()
     command = [
         "gcc", "-std=c99", "-Wall", "-Wextra", "-Wno-unused-parameter",
-        "-O2", "-D_DEFAULT_SOURCE",
+        "-O2", "-D_DEFAULT_SOURCE", "-pthread",
         "-I", str(ROOT),
         *cflags,
     ]
