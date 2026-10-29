@@ -220,6 +220,10 @@ static void set_status(const char *msg) {
     snprintf(status_msg, sizeof(status_msg), "%s", msg);
 }
 
+static const char *center_text(const char *english, const char *turkish) {
+    return gnuchan_lang_is_turkish() ? turkish : english;
+}
+
 static void set_status_fmt(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -321,7 +325,8 @@ static void refresh_update_checks(const char *home) {
         github_check_done = 1;
         update_available = 0;
         gnuchan_update_count = 0;
-        set_status("Automatic update checks are disabled in settings");
+        set_status(center_text("Automatic update checks are disabled in settings",
+                               "Otomatik guncelleme denetimleri ayarlarda kapali"));
         checking_updates = 0;
         state_revision++;
         pthread_mutex_unlock(&state_mutex);
@@ -482,7 +487,8 @@ static void load_installed_packages(void) {
     FILE *fp = popen(cmd, "r");
     if (!fp) {
         pthread_mutex_lock(&state_mutex);
-        set_status("dpkg-query could not be started");
+        set_status(center_text("Could not start dpkg-query",
+                               "dpkg-query baslatilamadi"));
         pthread_mutex_unlock(&state_mutex);
         return;
     }
@@ -510,7 +516,7 @@ static void load_installed_packages(void) {
     int rc = pclose(fp);
     if (!WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
         pthread_mutex_lock(&state_mutex);
-        set_status("dpkg-query failed");
+        set_status(center_text("dpkg-query failed", "dpkg-query basarisiz"));
         pthread_mutex_unlock(&state_mutex);
     }
 }
@@ -522,7 +528,8 @@ static void check_apt_updates(void) {
     char out[CMD_BUF_LEN * 4];
     if (run_cmd(cmd, out, sizeof(out)) != 0) {
         pthread_mutex_lock(&state_mutex);
-        set_status("apt guncelleme denetimi calismadi");
+        set_status(center_text("Could not check apt updates",
+                               "apt guncelleme denetimi calismadi"));
         pthread_mutex_unlock(&state_mutex);
         return;
     }
@@ -637,11 +644,15 @@ static void check_github_versions(const char *home) {
     }
     github_check_done = 1;
     if (github_check_failures > 0) {
-        set_status_fmt("GitHub check incomplete: %d of %d installed GnuChan program(s) unavailable",
+        set_status_fmt(center_text(
+                           "GitHub check incomplete: %d of %d installed GnuChan program(s) unavailable",
+                           "GitHub denetimi tamamlanamadi: %d kurulu GnuChan programindan %d tanesine ulasilamadi"),
                        github_check_failures,
                        checked);
     } else {
-        set_status_fmt("GitHub checked %d installed GnuChan program(s); %d update(s)",
+        set_status_fmt(center_text(
+                           "GitHub checked %d installed GnuChan program(s); %d update(s)",
+                           "GitHub %d kurulu GnuChan programini denetledi; %d guncelleme bulundu"),
                        checked,
                        gnuchan_update_count);
     }
@@ -691,10 +702,11 @@ static int do_install(const char *name) {
     char out[CMD_BUF_LEN * 4];
     int rc = run_cmd(cmd, out, sizeof(out));
     if (rc == 0) {
-        set_status_fmt("%s kuruldu", name);
+        set_status_fmt(center_text("%s installed", "%s kuruldu"), name);
         return 0;
     }
-    set_status_fmt("%s kurulamadi: %.200s", name, out);
+    set_status_fmt(center_text("%s could not be installed: %.200s",
+                               "%s kurulamadi: %.200s"), name, out);
     return -1;
 }
 
@@ -707,10 +719,11 @@ static int do_remove(const char *name) {
     char out[CMD_BUF_LEN * 4];
     int rc = run_cmd(cmd, out, sizeof(out));
     if (rc == 0) {
-        set_status_fmt("%s kaldirildi", name);
+        set_status_fmt(center_text("%s removed", "%s kaldirildi"), name);
         return 0;
     }
-    set_status_fmt("%s kaldirilamadi: %.200s", name, out);
+    set_status_fmt(center_text("%s could not be removed: %.200s",
+                               "%s kaldirilamadi: %.200s"), name, out);
     return -1;
 }
 
@@ -722,24 +735,30 @@ static int do_upgrade_all(void) {
     char out[CMD_BUF_LEN * 4];
     int rc = run_cmd(cmd, out, sizeof(out));
     if (rc == 0) {
-        set_status("tum guncellemeler uygulandi");
+        set_status(center_text("All updates installed",
+                               "tum guncellemeler uygulandi"));
         return 0;
     }
-    set_status_fmt("guncelleme basarisiz: %.200s", out);
+    set_status_fmt(center_text("Update failed: %.200s",
+                               "guncelleme basarisiz: %.200s"), out);
     return -1;
 }
 
 static int do_update_gnuchan_all(void) {
     const struct passwd *account = getpwuid(getuid());
     if (!account || !account->pw_name || !account->pw_name[0]) {
-        set_status("GnuChan update failed: cannot identify the current account");
+        set_status(center_text(
+            "GnuChan update failed: cannot identify the current account",
+            "GnuChan guncellemesi basarisiz: kullanici hesabi belirlenemedi"));
         return -1;
     }
     char cmd[CMD_BUF_LEN];
     for (const char *p = account->pw_name; *p; p++) {
         if (!(isalnum((unsigned char)*p) || *p == '_' || *p == '-' ||
               *p == '.')) {
-            set_status("GnuChan update failed: invalid current account name");
+            set_status(center_text(
+                "GnuChan update failed: invalid current account name",
+                "GnuChan guncellemesi basarisiz: gecersiz kullanici adi"));
             return -1;
         }
     }
@@ -749,7 +768,8 @@ static int do_update_gnuchan_all(void) {
                            "%s/usr/local/libexec/gnuchanos-programs-update "
                            "--update '%s' 2>&1", auth, account->pw_name);
     if (written < 0 || (size_t)written >= sizeof(cmd)) {
-        set_status("GnuChan update command is too long");
+        set_status(center_text("GnuChan update command is too long",
+                               "GnuChan guncelleme komutu cok uzun"));
         return -1;
     }
     size_t pos = (size_t)written;
@@ -759,24 +779,29 @@ static int do_update_gnuchan_all(void) {
             int added = snprintf(cmd + pos, sizeof(cmd) - pos, " '%s'",
                                  gnuchan_repos[i].program);
             if (added < 0 || (size_t)added >= sizeof(cmd) - pos) {
-                set_status("GnuChan update command is too long");
+                set_status(center_text("GnuChan update command is too long",
+                                       "GnuChan guncelleme komutu cok uzun"));
                 return -1;
             }
             pos += (size_t)added;
         }
     }
     if (pos == (size_t)written) {
-        set_status("guncellenecek GnuChan paketi yok");
+        set_status(center_text("No GnuChan programs to update",
+                               "guncellenecek GnuChan paketi yok"));
         return 0;
     }
 
     char out[CMD_BUF_LEN * 4];
     int rc = run_cmd(cmd, out, sizeof(out));
     if (rc == 0) {
-        set_status("GnuChan source updates installed successfully");
+        set_status(center_text("GnuChan program updates installed successfully",
+                               "GnuChan program guncellemeleri yuklendi"));
         return 0;
     }
-    set_status_fmt("GnuChan update failed (exit %d): %.180s", rc, out);
+    set_status_fmt(center_text("GnuChan update failed (exit %d): %.180s",
+                               "GnuChan guncellemesi basarisiz (cikis %d): %.180s"),
+                   rc, out);
     return -1;
 }
 
@@ -833,21 +858,22 @@ static GC create_gc(Display *dpy, Window win) {
 /* --- sekme / buton durumu ------------------------------------------------ */
 
 typedef struct SidebarItem {
-    const char *label;
+    const char *label_en;
+    const char *label_tr;
     ViewId view;
 } SidebarItem;
 
 static SidebarItem sidebar_items[] = {
-    {"Tum Paketler", VIEW_ALL},
-    {"Yuklenmisler", VIEW_INSTALLED},
-    {"Guncellemeler", VIEW_UPDATES},
-    {"GnuChan Programlari", VIEW_GNUCHAN},
-    {"System", VIEW_SYSTEM},
-    {"Internet", VIEW_INTERNET},
-    {"Graphics", VIEW_GRAPHICS},
-    {"Multimedia", VIEW_MULTIMEDIA},
-    {"Development", VIEW_DEVELOPMENT},
-    {"Other", VIEW_OTHER},
+    {"All packages", "Tum Paketler", VIEW_ALL},
+    {"Installed", "Yuklenmisler", VIEW_INSTALLED},
+    {"Updates", "Guncellemeler", VIEW_UPDATES},
+    {"GnuChan programs", "GnuChan Programlari", VIEW_GNUCHAN},
+    {"System", "System", VIEW_SYSTEM},
+    {"Internet", "Internet", VIEW_INTERNET},
+    {"Graphics", "Graphics", VIEW_GRAPHICS},
+    {"Multimedia", "Multimedia", VIEW_MULTIMEDIA},
+    {"Development", "Development", VIEW_DEVELOPMENT},
+    {"Other", "Other", VIEW_OTHER},
 };
 static int sidebar_count =
     (int)(sizeof(sidebar_items) / sizeof(sidebar_items[0]));
@@ -935,7 +961,9 @@ static void draw_sidebar(Display *dpy, Window win, GC gc) {
         }
         draw_text(dpy, win, gc,
                   get_color(dpy, sel ? 0xFFFFFFU : COL_TEXT_DIM),
-                  14, yy + 16, sidebar_items[i].label);
+                  14, yy + 16,
+                  center_text(sidebar_items[i].label_en,
+                              sidebar_items[i].label_tr));
 
         /* hint */
         char hint[64] = {0};
@@ -968,7 +996,9 @@ static void draw_header(Display *dpy, Window win, GC gc) {
         if (current_view == sidebar_items[i].view) {
             static char view_title[96];
             snprintf(view_title, sizeof(view_title),
-                     "GnuChanSoftwareCenter - %s", sidebar_items[i].label);
+                     "GnuChanSoftwareCenter - %s",
+                     center_text(sidebar_items[i].label_en,
+                                 sidebar_items[i].label_tr));
             title = view_title;
             break;
         }
@@ -980,14 +1010,17 @@ static void draw_header(Display *dpy, Window win, GC gc) {
     draw_rect(dpy, win, gc, get_color(dpy, COL_BORDER), sx, 10, 280, 24);
     draw_text(dpy, win, gc, get_color(dpy, COL_TEXT), sx + 6, 10 + 18, search_text);
     if (search_text[0] == '\0') {
-        draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM), sx + 6, 10 + 18, "ara...");
+        draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM), sx + 6, 10 + 18,
+                  center_text("Search...", "ara..."));
     }
 }
 
 static void draw_package_list(Display *dpy, Window win, GC gc) {
     if (loading_packages) {
         draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM),
-                  LIST_LEFT, LIST_TOP + 20, "Scanning installed packages...");
+                  LIST_LEFT, LIST_TOP + 20,
+                  center_text("Scanning installed packages...",
+                              "Kurulu paketler taraniyor..."));
         return;
     }
     int yy = LIST_TOP - scroll_offset * ITEM_H;
@@ -1028,7 +1061,8 @@ static void draw_package_list(Display *dpy, Window win, GC gc) {
                       LIST_LEFT + (p->is_gnuchan ? 40 : 18), yy + 18, label);
             /* guncelleme var isareti */
             draw_text(dpy, win, gc, get_color(dpy, COL_UPDATE),
-                      LIST_RIGHT - 100, yy + 18, "GUNCELLEME");
+                      LIST_RIGHT - 100, yy + 18,
+                      center_text("UPDATE", "GUNCELLEME"));
         } else {
             snprintf(label, sizeof(label), "%s  %s", p->name, p->version);
             draw_text(dpy, win, gc, get_color(dpy, COL_TEXT),
@@ -1042,8 +1076,10 @@ static void draw_package_list(Display *dpy, Window win, GC gc) {
         draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM),
                   LIST_LEFT, LIST_TOP,
                   current_view == VIEW_GNUCHAN
-                      ? "No installed GnuChan programs found"
-                      : "No packages match this view");
+                      ? center_text("No installed GnuChan programs found",
+                                    "Kurulu GnuChan programi bulunamadi")
+                      : center_text("No packages match this view",
+                                    "Bu gorunumle eslesen paket yok"));
     }
 }
 
@@ -1067,12 +1103,14 @@ static void draw_footer(Display *dpy, Window win, GC gc) {
             fill_rect(dpy, win, gc, get_color(dpy, COL_DANGER),
                       bx, by, bw, bh);
             draw_text(dpy, win, gc, get_color(dpy, 0xFFFFFFU),
-                      bx + 14, by + 18, "Kaldir");
+                      bx + 14, by + 18,
+                      center_text("Remove", "Kaldir"));
         } else {
             fill_rect(dpy, win, gc, get_color(dpy, COL_BUTTON),
                       bx, by, bw, bh);
             draw_text(dpy, win, gc, get_color(dpy, 0xFFFFFFU),
-                      bx + 20, by + 18, "Yukle");
+                      bx + 20, by + 18,
+                      center_text("Install", "Yukle"));
         }
         bx += bw + 8;
     }
@@ -1082,12 +1120,14 @@ static void draw_footer(Display *dpy, Window win, GC gc) {
         fill_rect(dpy, win, gc, get_color(dpy, COL_SUCCESS),
                   bx, by, up_w, bh);
         draw_text(dpy, win, gc, get_color(dpy, 0xFFFFFFU),
-                  bx + 10, by + 18, "Tumunu Guncelle");
+                  bx + 10, by + 18,
+                  center_text("Update all", "Tumunu Guncelle"));
     } else {
         fill_rect(dpy, win, gc, get_color(dpy, 0x392150U),
                   bx, by, up_w, bh);
         draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM),
-                  bx + 10, by + 18, "Guncelleme Yok");
+                  bx + 10, by + 18,
+                  center_text("No updates", "Guncelleme Yok"));
     }
     bx += up_w + 8;
 
@@ -1096,35 +1136,46 @@ static void draw_footer(Display *dpy, Window win, GC gc) {
         fill_rect(dpy, win, gc, get_color(dpy, COL_BUTTON),
                   bx, by, gc_w, bh);
         char lbl[64];
-        snprintf(lbl, sizeof(lbl), "GnuChan Guncelle (%d)", gnuchan_update_count);
+        snprintf(lbl, sizeof(lbl), center_text("Update GnuChan (%d)",
+                                               "GnuChan Guncelle (%d)"),
+                 gnuchan_update_count);
         draw_text(dpy, win, gc, get_color(dpy, 0xFFFFFFU),
                   bx + 8, by + 18, lbl);
     } else if (update_checks_disabled) {
         fill_rect(dpy, win, gc, get_color(dpy, 0x392150U),
                   bx, by, gc_w, bh);
         draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM),
-                  bx + 8, by + 18, "Denetim kapali");
+                  bx + 8, by + 18,
+                  center_text("Checks disabled", "Denetim kapali"));
     } else if (github_check_done && github_check_failures == 0) {
         fill_rect(dpy, win, gc, get_color(dpy, 0x392150U),
                   bx, by, gc_w, bh);
         draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM),
-                  bx + 8, by + 18, "GnuChan Guncel");
+                  bx + 8, by + 18,
+                  center_text("GnuChan is up to date", "GnuChan Guncel"));
     } else if (github_check_done) {
         fill_rect(dpy, win, gc, get_color(dpy, COL_WARN),
                   bx, by, gc_w, bh);
         draw_text(dpy, win, gc, get_color(dpy, COL_BG),
-                  bx + 8, by + 18, "GitHub Denetlenemedi");
+                  bx + 8, by + 18,
+                  center_text("GitHub check failed",
+                              "GitHub Denetlenemedi"));
     } else if (loading_packages || checking_updates) {
         fill_rect(dpy, win, gc, get_color(dpy, 0x392150U),
                   bx, by, gc_w, bh);
         draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM),
                   bx + 8, by + 18,
-                  loading_packages ? "Loading packages..." : "Checking updates...");
+                  loading_packages
+                      ? center_text("Loading packages...",
+                                    "Paketler yukleniyor...")
+                      : center_text("Checking updates...",
+                                    "Guncellemeler denetleniyor..."));
     } else {
         fill_rect(dpy, win, gc, get_color(dpy, 0x392150U),
                   bx, by, gc_w, bh);
         draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM),
-                  bx + 8, by + 18, "GnuChan Guncel");
+                  bx + 8, by + 18,
+                  center_text("GnuChan is up to date", "GnuChan Guncel"));
     }
 
     if (status_msg[0]) {
@@ -1307,7 +1358,8 @@ static void handle_button(Display *dpy, Window win, GC gc, XButtonEvent *ev) {
         int bx = LIST_LEFT + 108;
         if (x >= bx && x < bx + 140 && update_available) {
             busy = 1;
-            set_status("tum guncellemeler uygulaniyor...");
+            set_status(center_text("Installing all updates...",
+                                   "tum guncellemeler uygulaniyor..."));
             redraw(dpy, win, gc);
             do_upgrade_all();
             busy = 0;
@@ -1322,7 +1374,8 @@ static void handle_button(Display *dpy, Window win, GC gc, XButtonEvent *ev) {
         bx += 148;
         if (x >= bx && x < bx + 140 && gnuchan_update_count > 0) {
             busy = 1;
-            set_status("GnuChan programlari guncelleniyor...");
+            set_status(center_text("Updating GnuChan programs...",
+                                   "GnuChan programlari guncelleniyor..."));
             redraw(dpy, win, gc);
             do_update_gnuchan_all();
             busy = 0;
@@ -1356,8 +1409,12 @@ static void *initial_load_worker(void *arg) {
     }
     loading_packages = 0;
     set_status(check_updates_on_start
-                   ? "Packages loaded; checking for updates in the background"
-                   : "Packages loaded; automatic update checks are disabled");
+                   ? center_text(
+                         "Packages loaded; checking for updates in the background",
+                         "Paketler yuklendi; guncellemeler arka planda denetleniyor")
+                   : center_text(
+                         "Packages loaded; automatic update checks are disabled",
+                         "Paketler yuklendi; otomatik guncelleme denetimi kapali"));
     rebuild_visible_list();
     state_revision++;
     pthread_mutex_unlock(&state_mutex);
@@ -1367,21 +1424,24 @@ static void *initial_load_worker(void *arg) {
 }
 
 int main(int argc, char **argv) {
+    gnuchan_lang_init();
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0) {
             printf("GnuChanSoftwareCenter %s\n", GNUCHANSOFTWARECENTER_VERSION);
             return 0;
         }
         if (strcmp(argv[i], "--help") == 0) {
-            printf("usage: GnuChanSoftwareCenter [--version] [--help]\n"
-                   "\nGnuchanOS paket yoneticisi. Tum Debian paketlerini listeler,\n"
-                   "guncellemeleri denetler ve GnuChan programlarini gunceller.\n"
-                   "Kurulu GnuChan programlarinin surumlerini denetler.\n");
+            printf("%s\n", center_text(
+                "Usage: GnuChanSoftwareCenter [--version] [--help]\n"
+                "\nGnuchanOS package manager. Lists Debian packages, checks for\n"
+                "updates, and updates installed GnuChan programs.\n",
+                "Kullanim: GnuChanSoftwareCenter [--version] [--help]\n"
+                "\nGnuchanOS paket yoneticisi. Debian paketlerini listeler,\n"
+                "guncellemeleri denetler ve GnuChan programlarini gunceller.\n"));
             return 0;
         }
     }
-
-    gnuchan_lang_init();
 
     const char *home = getenv("HOME");
     if (!home || !home[0]) {
