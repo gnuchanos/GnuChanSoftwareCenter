@@ -84,10 +84,10 @@ static int window_height = INITIAL_WIN_HEIGHT;
 #define COL_SELECT    0x392150U
 #define COL_BUTTON    0x8B5CB8U
 #define COL_BUTTON_H  0xA572D1U
-#define COL_DANGER    0xFF6B8AU
-#define COL_SUCCESS   0x6EA879U
-#define COL_WARN      0xD7A85AU
-#define COL_UPDATE    0xD7A85AU
+#define COL_DANGER    0x75478FU
+#define COL_SUCCESS   0x8B5CB8U
+#define COL_WARN      0xB78ED6U
+#define COL_UPDATE    0xA855F7U
 
 /* --- paket modeli -------------------------------------------------------- */
 
