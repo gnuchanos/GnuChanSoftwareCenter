@@ -17,8 +17,10 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -38,9 +40,10 @@ BIN_DIR = Path("/usr/local/bin")
 APPS_DIR = Path("/usr/share/applications")
 DESKTOP_FILE = APPS_DIR / "gnuchansoftwarecenter.desktop"
 
-CONFIG_SOURCE = ROOT / "GnuChanSoftwareCenter_config" / "GnuChanSoftwareCenter.py"
+CONFIG_SOURCE = ROOT / "GnuChanSoftwareCenter_config" / "GnuChanSoftwareCenter.conf"
 CONFIG_DIR_NAME = "GnuChanSoftwareCenter"
-CONFIG_FILE_NAME = "GnuChanSoftwareCenter.py"
+CONFIG_FILE_NAME = "GnuChanSoftwareCenter.conf"
+SETTINGS_FILE_NAME = "GnuChanSoftwareCenter.py"
 
 SOURCES = (
     "gnuchan_lang.c",
@@ -243,19 +246,76 @@ def install_config() -> None:
     home, uid, gid = user
     directory = home / ".config" / CONFIG_DIR_NAME
     file_target = directory / CONFIG_FILE_NAME
+    settings_target = directory / SETTINGS_FILE_NAME
 
     directory.mkdir(parents=True, exist_ok=True)
     if file_target.exists():
-        file_target.unlink()
-        detail(f"removed the old {file_target}")
+        detail(f"preserved existing settings at {file_target}")
+    else:
+        contents = (migrate_legacy_settings(settings_target)
+                    if settings_target.is_file()
+                    else CONFIG_SOURCE.read_text(encoding="utf-8"))
+        try:
+            with file_target.open("x", encoding="utf-8") as settings_file:
+                settings_file.write(contents)
+            detail(f"installed {file_target}")
+        except FileExistsError:
+            detail(f"preserved settings created during installation at {file_target}")
 
-    shutil.copyfile(CONFIG_SOURCE, file_target)
+    if settings_target.exists():
+        detail(f"preserved legacy settings at {settings_target}")
+
+    file_target.chmod(0o600)
     try:
         os.chown(directory, uid, gid)
         os.chown(file_target, uid, gid)
     except OSError:
         pass
-    detail(f"installed {file_target}")
+
+
+def read_settings_values(path: Path) -> dict[str, bool | str]:
+    values: dict[str, bool | str] = {
+        "Version": "0.2.0",
+        "ShowInstalled": False,
+        "CheckUpdates": True,
+        "PackageManager": "apt",
+        "RequireAuth": True,
+    }
+    assignment = re.compile(
+        r"\b(Version|ShowInstalled|CheckUpdates|PackageManager|RequireAuth)"
+        r"\s*=\s*(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|True|False)"
+        r"(?=\s|,|\)|$)"
+    )
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.split("#", 1)[0]
+        for key, raw_value in assignment.findall(line):
+            raw_value = raw_value.strip()
+            if key in ("ShowInstalled", "CheckUpdates", "RequireAuth"):
+                if raw_value in ("True", "False"):
+                    values[key] = raw_value == "True"
+            elif key in ("Version", "PackageManager"):
+                try:
+                    parsed = ast.literal_eval(raw_value)
+                except (SyntaxError, ValueError):
+                    continue
+                if not isinstance(parsed, str):
+                    continue
+                if key == "Version" and re.fullmatch(r"\d+(?:\.\d+){1,2}", parsed):
+                    values[key] = parsed
+                elif key == "PackageManager" and parsed == "apt":
+                    values[key] = parsed
+
+    return values
+
+
+def migrate_legacy_settings(path: Path) -> str:
+    values = read_settings_values(path)
+
+    lines = []
+    for key, value in values.items():
+        rendered = "True" if value is True else "False" if value is False else repr(value)
+        lines.append(f"{key} = {rendered}")
+    return "\n".join(lines) + "\n"
 
 
 def uninstall() -> None:

@@ -10,8 +10,8 @@
  * denetimleri arayuz acildiktan sonra arka planda yapilir.
  *
  * Islevler:
- *   - Butun Debian paketlerini tarama (dpkg-query)
- *   - Yuklenmis paketleri listeleme
+ *   - Debian depo katalogunu apt-cache ile listeleme
+ *   - Yuklenmis paket durumunu dpkg-query ile isaretleme
  *   - Guncelleme denetimi (apt-get -s upgrade)
  *   - Tekli paket kurma / kaldirma (apt-get install / remove)
  *   - Tum guncellemeleri tek seferde uygulama
@@ -61,10 +61,13 @@ static int window_height = INITIAL_WIN_HEIGHT;
 #define ITEM_H     26
 #define LIST_TOP   (HEADER_H + 10)
 #define LIST_LEFT  (SIDEBAR_W + 10)
-#define LIST_RIGHT (WIN_WIDTH - 10)
+#define LIST_RIGHT (WIN_WIDTH - 25)
 #define LIST_BOTTOM (WIN_HEIGHT - FOOTER_H - 10)
+#define SCROLLBAR_X (WIN_WIDTH - 18)
+#define SCROLLBAR_W 8
 
-#define MAX_PACKAGES 4096
+#define MAX_PACKAGES 131072
+#define PACKAGE_HASH_SIZE 262144
 #define MAX_NAME_LEN 256
 #define MAX_VERSION_LEN 64
 #define MAX_DESC_LEN 512
@@ -103,6 +106,8 @@ typedef enum PackageCategory {
     CATEGORY_GRAPHICS,
     CATEGORY_MULTIMEDIA,
     CATEGORY_DEVELOPMENT,
+    CATEGORY_GAMES,
+    CATEGORY_BROWSER,
     CATEGORY_OTHER,
 } PackageCategory;
 
@@ -122,6 +127,7 @@ typedef struct Package {
 
 static Package *pkg_head = NULL;
 static int pkg_count = 0;
+static Package *pkg_hash[PACKAGE_HASH_SIZE];
 
 /* --- UI durumu ----------------------------------------------------------- */
 
@@ -135,12 +141,16 @@ typedef enum ViewId {
     VIEW_GRAPHICS,
     VIEW_MULTIMEDIA,
     VIEW_DEVELOPMENT,
+    VIEW_GAMES,
+    VIEW_BROWSER,
     VIEW_OTHER,
 } ViewId;
 
 static ViewId current_view = VIEW_ALL;
 static char search_text[256] = {0};
+static int search_focused = 0;
 static int scroll_offset = 0;
+static int scrollbar_dragging = 0;
 static int selected_index = -1;
 static char status_msg[512] = {0};
 static int busy = 0;
@@ -148,7 +158,7 @@ static int update_available = 0;
 static int gnuchan_update_count = 0;
 static int github_check_done = 0;
 static int github_check_failures = 0;
-static int show_installed_by_default = 1;
+static int show_installed_by_default = 0;
 static int check_updates_on_start = 1;
 static int require_authentication = 1;
 static int update_checks_disabled = 0;
@@ -206,7 +216,7 @@ static GnuchanRepo gnuchan_repos[] = {
      .config_file = "GnuChanScreenShoot.py"},
     {.repo = "GnuChanSoftwareCenter", .program = "GnuChanSoftwareCenter",
      .config_dir = "GnuChanSoftwareCenter",
-     .config_file = "GnuChanSoftwareCenter.py"},
+     .config_file = "GnuChanSoftwareCenter.conf"},
     {.repo = "GnuChanBrowser", .program = "GnuChanBrowser",
      .config_dir = "GnuChanBrowser", .config_file = "config.py"},
     {.repo = "GnuChanDM", .program = "GnuChanDM", .config_dir = "GnuChanDM",
@@ -237,60 +247,88 @@ static int parse_setting_bool(const char *value, int fallback) {
     return fallback;
 }
 
+static void apply_center_setting(const char *key, const char *value) {
+    if (strcmp(key, "ShowInstalled") == 0) {
+        show_installed_by_default = parse_setting_bool(
+            value, show_installed_by_default);
+    } else if (strcmp(key, "CheckUpdates") == 0) {
+        check_updates_on_start = parse_setting_bool(
+            value, check_updates_on_start);
+    } else if (strcmp(key, "RequireAuth") == 0) {
+        require_authentication = parse_setting_bool(
+            value, require_authentication);
+    }
+}
+
+static void parse_center_settings_line(char *line) {
+    char *comment = strchr(line, '#');
+    if (comment) *comment = '\0';
+
+    /* Accept flat .conf lines and GnuChanSettings' non-executed call format:
+       gcl_SoftwareCenter.Settings(ShowInstalled=True, ...). */
+    for (char *equals = strchr(line, '='); equals;
+         equals = strchr(equals + 1, '=')) {
+        char *key_end = equals;
+        while (key_end > line && isspace((unsigned char)key_end[-1])) {
+            key_end--;
+        }
+        char *key_start = key_end;
+        while (key_start > line &&
+               (isalnum((unsigned char)key_start[-1]) ||
+                key_start[-1] == '_')) {
+            key_start--;
+        }
+        size_t key_length = (size_t)(key_end - key_start);
+        if (key_length == 0 || key_length >= 64) continue;
+
+        char key[64], value[128];
+        memcpy(key, key_start, key_length);
+        key[key_length] = '\0';
+
+        const char *value_start = equals + 1;
+        while (isspace((unsigned char)*value_start)) value_start++;
+        size_t value_length = strcspn(value_start, ", )\t\r\n");
+        if (value_length >= 2 &&
+            ((value_start[0] == '"' &&
+              value_start[value_length - 1] == '"') ||
+             (value_start[0] == '\'' &&
+              value_start[value_length - 1] == '\''))) {
+            value_start++;
+            value_length -= 2;
+        }
+        if (value_length == 0 || value_length >= sizeof(value)) continue;
+        memcpy(value, value_start, value_length);
+        value[value_length] = '\0';
+        apply_center_setting(key, value);
+    }
+}
+
 static void load_center_settings(const char *home) {
     const char *xdg = getenv("XDG_CONFIG_HOME");
-    char path[CONFIG_PATH_LEN];
+    char settings_path[CONFIG_PATH_LEN], config_path[CONFIG_PATH_LEN];
     if (xdg && xdg[0]) {
-        snprintf(path, sizeof(path),
+        snprintf(settings_path, sizeof(settings_path),
                  "%s/GnuChanSoftwareCenter/GnuChanSoftwareCenter.py", xdg);
+        snprintf(config_path, sizeof(config_path),
+                 "%s/GnuChanSoftwareCenter/GnuChanSoftwareCenter.conf", xdg);
     } else {
-        snprintf(path, sizeof(path),
+        snprintf(settings_path, sizeof(settings_path),
                  "%s/.config/GnuChanSoftwareCenter/GnuChanSoftwareCenter.py",
+                 home);
+        snprintf(config_path, sizeof(config_path),
+                 "%s/.config/GnuChanSoftwareCenter/GnuChanSoftwareCenter.conf",
                  home);
     }
 
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        return;
-    }
+    /* The flat config is authoritative; the non-executed .py parser remains
+       only as a compatibility fallback for older installations. */
+    FILE *f = fopen(config_path, "r");
+    if (!f) f = fopen(settings_path, "r");
+    if (!f) return;
+
     char line[LINE_BUF_LEN];
     while (fgets(line, sizeof(line), f)) {
-        char *equals = strchr(line, '=');
-        if (!equals) {
-            continue;
-        }
-        char key[64] = {0}, value[128] = {0};
-        size_t key_length = (size_t)(equals - line);
-        while (key_length > 0 && isspace((unsigned char)line[key_length - 1])) {
-            key_length--;
-        }
-        size_t key_start = 0;
-        while (key_start < key_length &&
-               isspace((unsigned char)line[key_start])) {
-            key_start++;
-        }
-        size_t key_size = key_length - key_start;
-        if (key_size == 0 || key_size >= sizeof(key)) {
-            continue;
-        }
-        memcpy(key, line + key_start, key_size);
-        const char *value_start = equals + 1;
-        while (isspace((unsigned char)*value_start)) value_start++;
-        size_t value_length = strcspn(value_start, ", )#\t\r\n");
-        if (value_length == 0 || value_length >= sizeof(value)) {
-            continue;
-        }
-        memcpy(value, value_start, value_length);
-        if (strcmp(key, "ShowInstalled") == 0) {
-            show_installed_by_default = parse_setting_bool(
-                value, show_installed_by_default);
-        } else if (strcmp(key, "CheckUpdates") == 0) {
-            check_updates_on_start = parse_setting_bool(
-                value, check_updates_on_start);
-        } else if (strcmp(key, "RequireAuth") == 0) {
-            require_authentication = parse_setting_bool(
-                value, require_authentication);
-        }
+        parse_center_settings_line(line);
     }
     fclose(f);
 }
@@ -419,11 +457,24 @@ static void pkg_free_all(void) {
     }
     pkg_head = NULL;
     pkg_count = 0;
+    memset(pkg_hash, 0, sizeof(pkg_hash));
+}
+
+static size_t pkg_hash_index(const char *name) {
+    unsigned long hash = 2166136261UL;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        hash = (hash ^ *p) * 16777619UL;
+    }
+    return (size_t)(hash & (PACKAGE_HASH_SIZE - 1));
 }
 
 static Package *pkg_find(const char *name) {
-    for (Package *p = pkg_head; p; p = p->next) {
+    size_t index = pkg_hash_index(name);
+    for (size_t probed = 0; probed < PACKAGE_HASH_SIZE; probed++) {
+        Package *p = pkg_hash[index];
+        if (!p) return NULL;
         if (strcmp(p->name, name) == 0) return p;
+        index = (index + 1) & (PACKAGE_HASH_SIZE - 1);
     }
     return NULL;
 }
@@ -432,7 +483,28 @@ static void pkg_add(const char *name, const char *version,
                     const char *desc, PkgState state,
                     PackageCategory category,
                     int is_gnuchan, int has_update, int github_update) {
-    if (pkg_find(name) || pkg_count >= MAX_PACKAGES) return;
+    Package *existing = pkg_find(name);
+    if (existing) {
+        if (existing->state != PKG_STATE_INSTALLED ||
+            state == PKG_STATE_INSTALLED) {
+            if (version && version[0]) {
+                snprintf(existing->version, sizeof(existing->version), "%s",
+                         version);
+            }
+        }
+        if (desc && desc[0]) {
+            snprintf(existing->desc, sizeof(existing->desc), "%s", desc);
+        }
+        existing->category = category;
+        existing->is_gnuchan |= is_gnuchan;
+        if (state == PKG_STATE_INSTALLED) {
+            existing->state = PKG_STATE_INSTALLED;
+        }
+        existing->has_update |= has_update;
+        existing->github_update |= github_update;
+        return;
+    }
+    if (pkg_count >= MAX_PACKAGES) return;
     Package *p = calloc(1, sizeof(*p));
     if (!p) return;
     snprintf(p->name, sizeof(p->name), "%s", name);
@@ -446,6 +518,11 @@ static void pkg_add(const char *name, const char *version,
     p->github_update = github_update;
     p->next = pkg_head;
     pkg_head = p;
+    size_t index = pkg_hash_index(name);
+    while (pkg_hash[index]) {
+        index = (index + 1) & (PACKAGE_HASH_SIZE - 1);
+    }
+    pkg_hash[index] = p;
     pkg_count++;
 }
 
@@ -457,6 +534,9 @@ static int is_gnuchan_binary(const char *name) {
 }
 
 static PackageCategory category_for_section(const char *section) {
+    const char *base_section = strrchr(section, '/');
+    if (base_section) section = base_section + 1;
+    if (strncmp(section, "games", 5) == 0) return CATEGORY_GAMES;
     if (strncmp(section, "net", 3) == 0 ||
         strncmp(section, "web", 3) == 0 ||
         strncmp(section, "mail", 4) == 0) {
@@ -479,6 +559,122 @@ static PackageCategory category_for_section(const char *section) {
         return CATEGORY_SYSTEM;
     }
     return CATEGORY_OTHER;
+}
+
+static int text_contains_case_insensitive(const char *text, const char *needle) {
+    if (!text || !needle || !needle[0]) return 0;
+    for (const char *start = text; *start; start++) {
+        const char *left = start;
+        const char *right = needle;
+        while (*left && *right &&
+               tolower((unsigned char)*left) ==
+                   tolower((unsigned char)*right)) {
+            left++;
+            right++;
+        }
+        if (!*right) return 1;
+    }
+    return 0;
+}
+
+static int is_browser_package(const char *name, const char *description,
+                              const char *section) {
+    static const char *const prefixes[] = {
+        "firefox", "chromium", "epiphany", "falkon", "midori",
+        "qutebrowser", "konqueror", "iceweasel", "vivaldi", "brave",
+        "torbrowser", "netsurf", "dillo", "lynx", "w3m", "links",
+        "elinks", "surf", "uzbl", "www-browser", NULL,
+    };
+    const char *base_section = strrchr(section, '/');
+    if (base_section) section = base_section + 1;
+    for (size_t i = 0; prefixes[i]; i++) {
+        if (strncmp(name, prefixes[i], strlen(prefixes[i])) == 0) return 1;
+    }
+    return strstr(name, "browser") != NULL ||
+           (strncmp(section, "web", 3) == 0 &&
+            (text_contains_case_insensitive(description, "web browser") ||
+             text_contains_case_insensitive(description, "internet browser")));
+}
+
+static void add_catalog_package(const char *name, const char *version,
+                                const char *description,
+                                const char *section) {
+    if (!name[0]) return;
+    PackageCategory category = category_for_section(section);
+    if (is_browser_package(name, description, section)) {
+        category = CATEGORY_BROWSER;
+    }
+    pkg_add(name, version, description, PKG_STATE_NOT_INSTALLED, category,
+            is_gnuchan_binary(name), 0, 0);
+}
+
+static void load_available_packages(void) {
+    FILE *fp = popen("apt-cache dumpavail 2>/dev/null", "r");
+    if (!fp) {
+        pthread_mutex_lock(&state_mutex);
+        set_status(center_text("Could not start apt-cache",
+                               "apt-cache baslatilamadi"));
+        pthread_mutex_unlock(&state_mutex);
+        return;
+    }
+
+    char line[LINE_BUF_LEN];
+    char name[MAX_NAME_LEN] = {0};
+    char version[MAX_VERSION_LEN] = {0};
+    char section[128] = {0};
+    char description[MAX_DESC_LEN] = {0};
+    int in_description = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '\n' || line[0] == '\r') {
+            pthread_mutex_lock(&state_mutex);
+            add_catalog_package(name, version, description, section);
+            pthread_mutex_unlock(&state_mutex);
+            name[0] = version[0] = section[0] = description[0] = '\0';
+            in_description = 0;
+            continue;
+        }
+        if (in_description && isspace((unsigned char)line[0])) {
+            char *text = line;
+            while (*text == ' ' || *text == '\t') text++;
+            size_t length = strcspn(text, "\r\n");
+            size_t used = strlen(description);
+            if (used && used + 1 < sizeof(description)) {
+                description[used++] = ' ';
+                description[used] = '\0';
+            }
+            if (length > sizeof(description) - used - 1) {
+                length = sizeof(description) - used - 1;
+            }
+            memcpy(description + used, text, length);
+            description[used + length] = '\0';
+            continue;
+        }
+        in_description = 0;
+        if (strncmp(line, "Package: ", 9) == 0) {
+            snprintf(name, sizeof(name), "%.*s",
+                     (int)strcspn(line + 9, "\r\n"), line + 9);
+        } else if (strncmp(line, "Version: ", 9) == 0) {
+            snprintf(version, sizeof(version), "%.*s",
+                     (int)strcspn(line + 9, "\r\n"), line + 9);
+        } else if (strncmp(line, "Section: ", 9) == 0) {
+            snprintf(section, sizeof(section), "%.*s",
+                     (int)strcspn(line + 9, "\r\n"), line + 9);
+        } else if (strncmp(line, "Description: ", 13) == 0) {
+            snprintf(description, sizeof(description), "%.*s",
+                     (int)strcspn(line + 13, "\r\n"), line + 13);
+            in_description = 1;
+        }
+    }
+    pthread_mutex_lock(&state_mutex);
+    add_catalog_package(name, version, description, section);
+    pthread_mutex_unlock(&state_mutex);
+    int rc = pclose(fp);
+    if (!WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
+        pthread_mutex_lock(&state_mutex);
+        set_status(center_text("apt-cache could not read the repository catalog",
+                               "apt-cache depo katalugunu okuyamadi"));
+        pthread_mutex_unlock(&state_mutex);
+    }
 }
 
 static void load_installed_packages(void) {
@@ -519,6 +715,7 @@ static void load_installed_packages(void) {
         set_status(center_text("dpkg-query failed", "dpkg-query basarisiz"));
         pthread_mutex_unlock(&state_mutex);
     }
+    load_available_packages();
 }
 
 /* Guncelleme denetimi: apt-get -s upgrade */
@@ -692,12 +889,31 @@ static void check_github_versions(const char *home) {
 
 /* --- paket islemleri ----------------------------------------------------- */
 
+static int valid_package_name(const char *name) {
+    if (!name || !(islower((unsigned char)name[0]) ||
+                   isdigit((unsigned char)name[0]))) {
+        return 0;
+    }
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        if (!(islower(*p) || isdigit(*p) || *p == '+' || *p == '.' ||
+              *p == '-')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int do_install(const char *name) {
+    if (!valid_package_name(name)) {
+        set_status(center_text("Refused an invalid package name",
+                               "Gecersiz paket adi reddedildi"));
+        return -1;
+    }
     char cmd[CMD_BUF_LEN];
     const char *auth = require_authentication && getuid() != 0
                            ? "pkexec " : "";
     snprintf(cmd, sizeof(cmd),
-             "%sapt-get install -y --no-install-recommends '%s' 2>&1",
+             "%sapt-get install -y --no-install-recommends --no-remove '%s' 2>&1",
              auth, name);
     char out[CMD_BUF_LEN * 4];
     int rc = run_cmd(cmd, out, sizeof(out));
@@ -711,6 +927,11 @@ static int do_install(const char *name) {
 }
 
 static int do_remove(const char *name) {
+    if (!valid_package_name(name)) {
+        set_status(center_text("Refused an invalid package name",
+                               "Gecersiz paket adi reddedildi"));
+        return -1;
+    }
     char cmd[CMD_BUF_LEN];
     const char *auth = require_authentication && getuid() != 0
                            ? "pkexec " : "";
@@ -873,6 +1094,8 @@ static SidebarItem sidebar_items[] = {
     {"Graphics", "Graphics", VIEW_GRAPHICS},
     {"Multimedia", "Multimedia", VIEW_MULTIMEDIA},
     {"Development", "Development", VIEW_DEVELOPMENT},
+    {"Games", "Oyunlar", VIEW_GAMES},
+    {"Browser", "Tarayicilar", VIEW_BROWSER},
     {"Other", "Other", VIEW_OTHER},
 };
 static int sidebar_count =
@@ -911,9 +1134,21 @@ static int view_matches(ViewId view, const Package *p) {
     case VIEW_GRAPHICS: return p->category == CATEGORY_GRAPHICS;
     case VIEW_MULTIMEDIA: return p->category == CATEGORY_MULTIMEDIA;
     case VIEW_DEVELOPMENT: return p->category == CATEGORY_DEVELOPMENT;
+    case VIEW_GAMES: return p->category == CATEGORY_GAMES;
+    case VIEW_BROWSER: return p->category == CATEGORY_BROWSER;
     case VIEW_OTHER: return p->category == CATEGORY_OTHER;
     }
     return 0;
+}
+
+static int list_visible_rows(void) {
+    int rows = (LIST_BOTTOM - LIST_TOP) / ITEM_H + 1;
+    return rows < 1 ? 1 : rows;
+}
+
+static int list_max_scroll(void) {
+    int max_scroll = visible_len - list_visible_rows();
+    return max_scroll > 0 ? max_scroll : 0;
 }
 
 static void rebuild_visible_list(void) {
@@ -928,10 +1163,8 @@ static void rebuild_visible_list(void) {
     if (selected_index >= visible_len) selected_index = visible_len - 1;
     if (selected_index < 0 && visible_len > 0) selected_index = 0;
 
-    int item_visible = (LIST_BOTTOM - LIST_TOP) / ITEM_H + 1;
-    if (item_visible < 1) item_visible = 1;
-    int max_scroll = visible_len - item_visible;
-    if (max_scroll < 0) max_scroll = 0;
+    int item_visible = list_visible_rows();
+    int max_scroll = list_max_scroll();
     if (scroll_offset > max_scroll) scroll_offset = max_scroll;
     if (scroll_offset < 0) scroll_offset = 0;
     if (selected_index >= 0 && selected_index < visible_len) {
@@ -954,14 +1187,14 @@ static void draw_sidebar(Display *dpy, Window win, GC gc) {
     int yy = HEADER_H + 20;
     for (int i = 0; i < sidebar_count; i++) {
         int sel = (current_view == sidebar_items[i].view);
-        int item_h = 34;
+        int item_h = 30;
         if (sel) {
             fill_rect(dpy, win, gc, get_color(dpy, COL_SELECT),
                       4, yy - 4, (unsigned int)(SIDEBAR_W - 8), (unsigned int)item_h);
         }
         draw_text(dpy, win, gc,
                   get_color(dpy, sel ? 0xFFFFFFU : COL_TEXT_DIM),
-                  14, yy + 16,
+                  14, yy + 14,
                   center_text(sidebar_items[i].label_en,
                               sidebar_items[i].label_tr));
 
@@ -974,7 +1207,7 @@ static void draw_sidebar(Display *dpy, Window win, GC gc) {
         }
         if (hint[0]) {
             draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM),
-                      SIDEBAR_W - 10 - (int)(strlen(hint) * 6), yy + 16, hint);
+                      SIDEBAR_W - 10 - (int)(strlen(hint) * 6), yy + 14, hint);
         }
         yy += item_h;
     }
@@ -1007,11 +1240,26 @@ static void draw_header(Display *dpy, Window win, GC gc) {
 
     int sx = WIN_WIDTH - 300;
     fill_rect(dpy, win, gc, get_color(dpy, COL_BG), sx, 10, 280, 24);
-    draw_rect(dpy, win, gc, get_color(dpy, COL_BORDER), sx, 10, 280, 24);
-    draw_text(dpy, win, gc, get_color(dpy, COL_TEXT), sx + 6, 10 + 18, search_text);
-    if (search_text[0] == '\0') {
+    draw_rect(dpy, win, gc,
+              get_color(dpy, search_focused ? COL_BUTTON : COL_BORDER),
+              sx, 10, 280, 24);
+    char visible_search[45];
+    size_t visible_search_length = strlen(search_text);
+    if (visible_search_length >= sizeof(visible_search)) {
+        visible_search_length = sizeof(visible_search) - 1;
+    }
+    memcpy(visible_search, search_text, visible_search_length);
+    visible_search[visible_search_length] = '\0';
+    draw_text(dpy, win, gc, get_color(dpy, COL_TEXT), sx + 6, 10 + 18,
+              visible_search);
+    if (search_text[0] == '\0' && !search_focused) {
         draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM), sx + 6, 10 + 18,
                   center_text("Search...", "ara..."));
+    }
+    if (search_focused) {
+        int cursor_x = sx + 6 + (int)(strlen(visible_search) * 6);
+        fill_rect(dpy, win, gc, get_color(dpy, COL_TEXT),
+                  cursor_x, 15, 1, 14);
     }
 }
 
@@ -1019,8 +1267,8 @@ static void draw_package_list(Display *dpy, Window win, GC gc) {
     if (loading_packages) {
         draw_text(dpy, win, gc, get_color(dpy, COL_TEXT_DIM),
                   LIST_LEFT, LIST_TOP + 20,
-                  center_text("Scanning installed packages...",
-                              "Kurulu paketler taraniyor..."));
+                  center_text("Scanning the Debian package catalog...",
+                              "Debian paket katalogu taraniyor..."));
         return;
     }
     int yy = LIST_TOP - scroll_offset * ITEM_H;
@@ -1061,7 +1309,7 @@ static void draw_package_list(Display *dpy, Window win, GC gc) {
                       LIST_LEFT + (p->is_gnuchan ? 40 : 18), yy + 18, label);
             /* guncelleme var isareti */
             draw_text(dpy, win, gc, get_color(dpy, COL_UPDATE),
-                      LIST_RIGHT - 100, yy + 18,
+                      LIST_RIGHT - 145, yy + 18,
                       center_text("UPDATE", "GUNCELLEME"));
         } else {
             snprintf(label, sizeof(label), "%s  %s", p->name, p->version);
@@ -1069,7 +1317,38 @@ static void draw_package_list(Display *dpy, Window win, GC gc) {
                       LIST_LEFT + (p->is_gnuchan ? 40 : 18), yy + 18, label);
         }
 
+        const char *state_label =
+            p->state == PKG_STATE_INSTALLED
+                ? center_text("Installed", "Yuklu")
+                : center_text("Available", "Mevcut");
+        draw_text(dpy, win, gc,
+                  get_color(dpy, p->state == PKG_STATE_INSTALLED
+                                     ? COL_SUCCESS : COL_TEXT_DIM),
+                  LIST_RIGHT - 66, yy + 18, state_label);
         yy += ITEM_H;
+    }
+
+    int rows = list_visible_rows();
+    int track_y = LIST_TOP;
+    int track_height = LIST_BOTTOM - LIST_TOP;
+    if (visible_len > rows && track_height > 0) {
+        fill_rect(dpy, win, gc, get_color(dpy, COL_SIDEBAR),
+                  SCROLLBAR_X, track_y, SCROLLBAR_W, (unsigned int)track_height);
+        int thumb_height = track_height * rows / visible_len;
+        if (thumb_height < 24) thumb_height = 24;
+        if (thumb_height > track_height) thumb_height = track_height;
+        int travel = track_height - thumb_height;
+        int thumb_y = track_y;
+        int max_scroll = list_max_scroll();
+        if (max_scroll > 0) {
+            thumb_y += travel * scroll_offset / max_scroll;
+        }
+        fill_rect(dpy, win, gc, get_color(dpy, COL_BUTTON),
+                  SCROLLBAR_X, thumb_y, SCROLLBAR_W,
+                  (unsigned int)thumb_height);
+        draw_rect(dpy, win, gc, get_color(dpy, COL_BORDER),
+                  SCROLLBAR_X, thumb_y, SCROLLBAR_W - 1,
+                  (unsigned int)thumb_height);
     }
 
     if (visible_len == 0) {
@@ -1206,6 +1485,26 @@ static void redraw(Display *dpy, Window win, GC gc) {
     XFlush(dpy);
 }
 
+static void set_scroll_from_pointer(int y) {
+    int track_y = LIST_TOP;
+    int track_height = LIST_BOTTOM - LIST_TOP;
+    int rows = list_visible_rows();
+    int thumb_height = track_height * rows / visible_len;
+    if (thumb_height < 24) thumb_height = 24;
+    if (thumb_height > track_height) thumb_height = track_height;
+    int travel = track_height - thumb_height;
+    int max_scroll = list_max_scroll();
+    if (travel <= 0 || max_scroll <= 0) {
+        scroll_offset = 0;
+        return;
+    }
+    int thumb_y = y - track_y - thumb_height / 2;
+    if (thumb_y < 0) thumb_y = 0;
+    if (thumb_y > travel) thumb_y = travel;
+    scroll_offset = thumb_y * max_scroll / travel;
+    selected_index = -1;
+}
+
 /* --- olay dongusu -------------------------------------------------------- */
 
 static void handle_keypress(Display *dpy, Window win, GC gc, XKeyEvent *ev) {
@@ -1217,13 +1516,14 @@ static void handle_keypress(Display *dpy, Window win, GC gc, XKeyEvent *ev) {
 
     if (ks == XK_Escape) {
         search_text[0] = '\0';
+        search_focused = 0;
         rebuild_visible_list();
         selected_index = visible_len > 0 ? 0 : -1;
         redraw(dpy, win, gc);
         return;
     }
 
-    if (ks == XK_BackSpace) {
+    if (search_focused && ks == XK_BackSpace) {
         int len = (int)strlen(search_text);
         if (len > 0) {
             search_text[len - 1] = '\0';
@@ -1234,6 +1534,11 @@ static void handle_keypress(Display *dpy, Window win, GC gc, XKeyEvent *ev) {
     }
 
     if (ks == XK_Return || ks == XK_KP_Enter) {
+        if (search_focused) {
+            search_focused = 0;
+            redraw(dpy, win, gc);
+            return;
+        }
         if (loading_packages || checking_updates) return;
         if (selected_index >= 0 && selected_index < visible_len) {
             Package *p = visible_list[selected_index].pkg;
@@ -1286,7 +1591,7 @@ static void handle_keypress(Display *dpy, Window win, GC gc, XKeyEvent *ev) {
         return;
     }
 
-    if (n > 0 && isprint((unsigned char)buf[0])) {
+    if (search_focused && n > 0 && isprint((unsigned char)buf[0])) {
         int len = (int)strlen(search_text);
         if (len < (int)sizeof(search_text) - 1) {
             search_text[len] = buf[0];
@@ -1304,10 +1609,35 @@ static void handle_button(Display *dpy, Window win, GC gc, XButtonEvent *ev) {
 
     int x = ev->x, y = ev->y;
 
+    if ((ev->button == Button4 || ev->button == Button5) &&
+        y >= LIST_TOP && y <= LIST_BOTTOM &&
+        x >= LIST_LEFT && x <= SCROLLBAR_X + SCROLLBAR_W) {
+        int max_scroll = list_max_scroll();
+        scroll_offset += ev->button == Button4 ? -3 : 3;
+        if (scroll_offset < 0) scroll_offset = 0;
+        if (scroll_offset > max_scroll) scroll_offset = max_scroll;
+        selected_index = -1;
+        redraw(dpy, win, gc);
+        return;
+    }
+
+    if (x >= WIN_WIDTH - 300 && x < WIN_WIDTH - 20 &&
+        y >= 10 && y < 34) {
+        search_focused = 1;
+        XSetInputFocus(dpy, win, RevertToParent, CurrentTime);
+        redraw(dpy, win, gc);
+        return;
+    }
+
+    if (search_focused) {
+        search_focused = 0;
+        redraw(dpy, win, gc);
+    }
+
     if (x < SIDEBAR_W && y > HEADER_H) {
         int yy = HEADER_H + 20;
         for (int i = 0; i < sidebar_count; i++) {
-            if (y >= yy - 4 && y < yy - 4 + 34) {
+            if (y >= yy - 4 && y < yy - 4 + 30) {
                 current_view = sidebar_items[i].view;
                 selected_index = -1;
                 scroll_offset = 0;
@@ -1315,16 +1645,21 @@ static void handle_button(Display *dpy, Window win, GC gc, XButtonEvent *ev) {
                 redraw(dpy, win, gc);
                 return;
             }
-            yy += 34;
+            yy += 30;
         }
         return;
     }
 
-    if (x > WIN_WIDTH - 300 && x < WIN_WIDTH - 20 && y > 10 && y < 34) {
+    if (x >= SCROLLBAR_X && x < SCROLLBAR_X + SCROLLBAR_W &&
+        y >= LIST_TOP && y <= LIST_BOTTOM && visible_len > list_visible_rows()) {
+        set_scroll_from_pointer(y);
+        scrollbar_dragging = 1;
+        redraw(dpy, win, gc);
         return;
     }
 
-    if (x >= LIST_LEFT && x < LIST_RIGHT && y >= LIST_TOP && y < LIST_BOTTOM) {
+    if (x >= LIST_LEFT && x < LIST_RIGHT &&
+        y >= LIST_TOP && y <= LIST_BOTTOM) {
         int rel_y = y - LIST_TOP + scroll_offset * ITEM_H;
         int idx = rel_y / ITEM_H;
         if (idx >= 0 && idx < visible_len) {
@@ -1387,6 +1722,12 @@ static void handle_button(Display *dpy, Window win, GC gc, XButtonEvent *ev) {
             return;
         }
     }
+}
+
+static void handle_motion(Display *dpy, Window win, GC gc, XMotionEvent *ev) {
+    if (!scrollbar_dragging) return;
+    set_scroll_from_pointer(ev->y);
+    redraw(dpy, win, gc);
 }
 
 /* --- ana ----------------------------------------------------------------- */
@@ -1481,7 +1822,7 @@ int main(int argc, char **argv) {
     XSetWMNormalHints(dpy, win, &size_hints);
     XSelectInput(dpy, win,
                  ExposureMask | KeyPressMask | ButtonPressMask |
-                 StructureNotifyMask);
+                 ButtonReleaseMask | PointerMotionMask | StructureNotifyMask);
     XMapWindow(dpy, win);
     XStoreName(dpy, win, "GnuChanSoftwareCenter");
     XFlush(dpy);
@@ -1530,6 +1871,12 @@ int main(int argc, char **argv) {
                 break;
             case ButtonPress:
                 handle_button(dpy, win, gc, &ev.xbutton);
+                break;
+            case ButtonRelease:
+                scrollbar_dragging = 0;
+                break;
+            case MotionNotify:
+                handle_motion(dpy, win, gc, &ev.xmotion);
                 break;
             case ConfigureNotify:
                 if (window_width != ev.xconfigure.width ||
