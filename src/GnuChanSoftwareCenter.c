@@ -71,6 +71,7 @@ static int window_height = INITIAL_WIN_HEIGHT;
 #define MAX_NAME_LEN 256
 #define MAX_VERSION_LEN 64
 #define MAX_DESC_LEN 512
+#define MAX_TAGS_LEN 2048
 #define CMD_BUF_LEN 8192
 #define LINE_BUF_LEN 2048
 #define CONFIG_PATH_LEN 512
@@ -106,6 +107,8 @@ typedef enum PackageCategory {
     CATEGORY_GRAPHICS,
     CATEGORY_MULTIMEDIA,
     CATEGORY_DEVELOPMENT,
+    CATEGORY_EDUCATION,
+    CATEGORY_SCIENCE,
     CATEGORY_GAMES,
     CATEGORY_BROWSER,
     CATEGORY_OTHER,
@@ -120,6 +123,7 @@ typedef struct Package {
     PackageCategory category;
     int is_gnuchan;      /* 1: GnuChan programi */
     int has_update;      /* 1: guncelleme mevcut (apt veya github) */
+    int apt_update;      /* 1: apt tarafinda guncelleme mevcut */
     int github_update;   /* 1: GitHub'da yeni versiyon var */
     int selected;        /* UI secim durumu */
     struct Package *next;
@@ -141,9 +145,10 @@ typedef enum ViewId {
     VIEW_GRAPHICS,
     VIEW_MULTIMEDIA,
     VIEW_DEVELOPMENT,
+    VIEW_EDUCATION,
+    VIEW_SCIENCE,
     VIEW_GAMES,
     VIEW_BROWSER,
-    VIEW_OTHER,
 } ViewId;
 
 static ViewId current_view = VIEW_ALL;
@@ -179,6 +184,7 @@ typedef struct GnuchanRepo {
     char program[128];   /* Program adi */
     char config_dir[128]; /* ~/.config/<config_dir>/ */
     char config_file[128]; /* Config dosya adi */
+    char legacy_config_file[128];
     char local_version[MAX_VERSION_LEN];
     char remote_version[MAX_VERSION_LEN];
     int has_remote;
@@ -187,40 +193,50 @@ typedef struct GnuchanRepo {
 
 static GnuchanRepo gnuchan_repos[] = {
     {.repo = "GnuChanWM", .program = "GnuChanWM", .config_dir = "GnuChanWM",
-     .config_file = "GnuChanWM.py"},
+     .config_file = "GnuChanWM.conf", .legacy_config_file = "GnuChanWM.py"},
     {.repo = "GnuChanSS", .program = "GnuChanSS", .config_dir = "GnuChanSS",
-     .config_file = "GnuChanSS.py"},
+     .config_file = "GnuChanSS.conf", .legacy_config_file = "GnuChanSS.py"},
     {.repo = "GnuChanSettings", .program = "GnuChanSettings",
      .config_dir = "GnuChanSettings", .config_file = "system.conf"},
     {.repo = "GnuChanDock", .program = "GnuChanDock",
-     .config_dir = "GnuChanDock", .config_file = "GnuChanDock.py"},
+     .config_dir = "GnuChanDock", .config_file = "GnuChanDock.conf",
+     .legacy_config_file = "GnuChanDock.py"},
     {.repo = "GnuChanFetch", .program = "GnuChanFetch",
-     .config_dir = "GnuChanFetch", .config_file = "GnuChanFetch.py"},
+     .config_dir = "GnuChanFetch", .config_file = "GnuChanFetch.conf",
+     .legacy_config_file = "GnuChanFetch.py"},
     {.repo = "GnuChanTerm", .program = "GnuChanTerm", .config_dir = "GnuChanTerm",
-     .config_file = "GnuChanTerm.py"},
+     .config_file = "GnuChanTerm.conf",
+     .legacy_config_file = "GnuChanTerm.py"},
     {.repo = "GnuChanTop", .program = "GnuChanTop", .config_dir = "GnuChanTop",
-     .config_file = "GnuChanTop.py"},
+     .config_file = "GnuChanTop.conf",
+     .legacy_config_file = "GnuChanTop.py"},
     {.repo = "GnuChanWifi", .program = "GnuChanWifi", .config_dir = "GnuChanWifi",
-     .config_file = "GnuChanWifi.py"},
+     .config_file = "config.conf", .legacy_config_file = "GnuChanWifi.py"},
     {.repo = "GnuChanLockScreen", .program = "GnuChanLockScreen",
-     .config_dir = "GnuChanSL", .config_file = "GnuChanSL.py"},
+     .config_dir = "GnuChanSL", .config_file = "GnuChanSL.conf",
+     .legacy_config_file = "GnuChanSL.py"},
     {.repo = "GnuChanNetworkManager", .program = "GnuChanNetworkManager",
-     .config_dir = "GnuChanNetworkManager", .config_file = "config.py"},
+     .config_dir = "GnuChanNetworkManager", .config_file = "config.conf",
+     .legacy_config_file = "config.py"},
     {.repo = "GnuChanNotification", .program = "GnuChanNotification",
      .config_dir = "GnuChanNotification",
-     .config_file = "GnuChanNotification.py"},
+     .config_file = "GnuChanNotification.conf",
+     .legacy_config_file = "GnuChanNotification.py"},
     {.repo = "GnuChanRunner", .program = "GnuChanRunner",
-     .config_dir = "GnuChanRunner", .config_file = "config.py"},
+     .config_dir = "GnuChanRunner", .config_file = "config.conf",
+     .legacy_config_file = "config.py"},
     {.repo = "GnuChanScreenShoot", .program = "GnuChanScreenShoot",
      .config_dir = "GnuChanScreenShoot",
-     .config_file = "GnuChanScreenShoot.py"},
+     .config_file = "GnuChanScreenShoot.conf",
+     .legacy_config_file = "GnuChanScreenShoot.py"},
     {.repo = "GnuChanSoftwareCenter", .program = "GnuChanSoftwareCenter",
      .config_dir = "GnuChanSoftwareCenter",
      .config_file = "GnuChanSoftwareCenter.conf"},
     {.repo = "GnuChanBrowser", .program = "GnuChanBrowser",
-     .config_dir = "GnuChanBrowser", .config_file = "config.py"},
+     .config_dir = "GnuChanBrowser", .config_file = "GnuChanBrowser.conf",
+     .legacy_config_file = "config.py"},
     {.repo = "GnuChanDM", .program = "GnuChanDM", .config_dir = "GnuChanDM",
-     .config_file = "GnuChanDM.py"},
+     .config_file = "GnuChanDM.conf", .legacy_config_file = "GnuChanDM.py"},
 };
 #define GNUCHAN_REPO_COUNT (sizeof(gnuchan_repos) / sizeof(gnuchan_repos[0]))
 
@@ -404,11 +420,35 @@ static int version_valid(const char *version) {
 
 /* --- config dosyasindan versiyon okuma ---------------------------------- */
 
-static void read_config_version(const char *home, const char *config_dir,
-                                const char *config_file, char *out,
+static int repo_config_path(const char *home, const GnuchanRepo *repo,
+                            char *path, size_t path_size) {
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    const char *config_home = xdg && xdg[0] == '/'
+                                  ? xdg : NULL;
+    int written = config_home
+        ? snprintf(path, path_size, "%s/%s/%s", config_home,
+                   repo->config_dir, repo->config_file)
+        : snprintf(path, path_size, "%s/.config/%s/%s", home,
+                   repo->config_dir, repo->config_file);
+    if (written < 0 || (size_t)written >= path_size) return 0;
+    if (access(path, R_OK) == 0 || !repo->legacy_config_file[0]) return 1;
+
+    written = config_home
+        ? snprintf(path, path_size, "%s/%s/%s", config_home,
+                   repo->config_dir, repo->legacy_config_file)
+        : snprintf(path, path_size, "%s/.config/%s/%s", home,
+                   repo->config_dir, repo->legacy_config_file);
+    return written >= 0 && (size_t)written < path_size;
+}
+
+static void read_config_version(const char *home, const GnuchanRepo *repo,
+                                char *out,
                                 size_t out_size) {
     char path[CONFIG_PATH_LEN];
-    snprintf(path, sizeof(path), "%s/.config/%s/%s", home, config_dir, config_file);
+    if (!repo_config_path(home, repo, path, sizeof(path))) {
+        snprintf(out, out_size, "0.0.0");
+        return;
+    }
 
     FILE *f = fopen(path, "r");
     if (!f) {
@@ -542,20 +582,62 @@ static PackageCategory category_for_section(const char *section) {
         strncmp(section, "mail", 4) == 0) {
         return CATEGORY_INTERNET;
     }
+    if (strncmp(section, "comm", 4) == 0 ||
+        strncmp(section, "news", 4) == 0 ||
+        strncmp(section, "hamradio", 8) == 0 ||
+        strncmp(section, "httpd", 5) == 0) {
+        return CATEGORY_INTERNET;
+    }
     if (strncmp(section, "graphics", 8) == 0 ||
-        strncmp(section, "x11", 3) == 0) {
+        strncmp(section, "x11", 3) == 0 ||
+        strncmp(section, "gnome", 5) == 0 ||
+        strncmp(section, "kde", 3) == 0) {
         return CATEGORY_GRAPHICS;
     }
     if (strncmp(section, "sound", 5) == 0 ||
         strncmp(section, "video", 5) == 0) {
         return CATEGORY_MULTIMEDIA;
     }
-    if (strncmp(section, "devel", 5) == 0) {
+    if (strncmp(section, "devel", 5) == 0 ||
+        strncmp(section, "lib", 3) == 0 ||
+        strncmp(section, "debug", 5) == 0 ||
+        strncmp(section, "interpreters", 12) == 0 ||
+        strncmp(section, "haskell", 7) == 0 ||
+        strncmp(section, "java", 4) == 0 ||
+        strncmp(section, "javascript", 10) == 0 ||
+        strncmp(section, "lisp", 4) == 0 ||
+        strncmp(section, "ocaml", 5) == 0 ||
+        strncmp(section, "perl", 4) == 0 ||
+        strncmp(section, "php", 3) == 0 ||
+        strncmp(section, "python", 6) == 0 ||
+        strncmp(section, "ruby", 4) == 0 ||
+        strncmp(section, "rust", 4) == 0 ||
+        strncmp(section, "vcs", 3) == 0 ||
+        strncmp(section, "tex", 3) == 0 ||
+        strncmp(section, "editors", 7) == 0) {
         return CATEGORY_DEVELOPMENT;
     }
+    if (strncmp(section, "education", 9) == 0) {
+        return CATEGORY_EDUCATION;
+    }
+    if (strncmp(section, "science", 7) == 0 ||
+        strncmp(section, "math", 4) == 0) {
+        return CATEGORY_SCIENCE;
+    }
     if (strncmp(section, "admin", 5) == 0 ||
+        strncmp(section, "base", 4) == 0 ||
         strncmp(section, "utils", 5) == 0 ||
-        strncmp(section, "kernel", 6) == 0) {
+        strncmp(section, "kernel", 6) == 0 ||
+        strncmp(section, "shells", 6) == 0 ||
+        strncmp(section, "metapackages", 12) == 0 ||
+        strncmp(section, "tasks", 5) == 0 ||
+        strncmp(section, "oldlibs", 7) == 0 ||
+        strncmp(section, "otherosfs", 9) == 0 ||
+        strncmp(section, "doc", 3) == 0 ||
+        strncmp(section, "fonts", 5) == 0 ||
+        strncmp(section, "localization", 12) == 0 ||
+        strncmp(section, "text", 4) == 0 ||
+        strncmp(section, "misc", 4) == 0) {
         return CATEGORY_SYSTEM;
     }
     return CATEGORY_OTHER;
@@ -577,35 +659,126 @@ static int text_contains_case_insensitive(const char *text, const char *needle) 
     return 0;
 }
 
-static int is_browser_package(const char *name, const char *description,
-                              const char *section) {
-    static const char *const prefixes[] = {
-        "firefox", "chromium", "epiphany", "falkon", "midori",
-        "qutebrowser", "konqueror", "iceweasel", "vivaldi", "brave",
-        "torbrowser", "netsurf", "dillo", "lynx", "w3m", "links",
-        "elinks", "surf", "uzbl", "www-browser", NULL,
-    };
+static int tag_list_contains(const char *tags, const char *tag) {
+    size_t tag_length = strlen(tag);
+    for (const char *current = tags; current && *current;) {
+        while (*current &&
+               (isspace((unsigned char)*current) || *current == ',')) {
+            current++;
+        }
+        const char *end = current;
+        while (*end && !isspace((unsigned char)*end) && *end != ',') end++;
+        if ((size_t)(end - current) == tag_length &&
+            strncmp(current, tag, tag_length) == 0) {
+            return 1;
+        }
+        current = end;
+    }
+    return 0;
+}
+
+static int is_browser_package(const char *description, const char *section,
+                              const char *tags) {
     const char *base_section = strrchr(section, '/');
     if (base_section) section = base_section + 1;
-    for (size_t i = 0; prefixes[i]; i++) {
-        if (strncmp(name, prefixes[i], strlen(prefixes[i])) == 0) return 1;
+    if (tag_list_contains(tags, "web::browser") ||
+        tag_list_contains(tags, "use::browsing")) {
+        return 1;
     }
-    return strstr(name, "browser") != NULL ||
-           (strncmp(section, "web", 3) == 0 &&
-            (text_contains_case_insensitive(description, "web browser") ||
-             text_contains_case_insensitive(description, "internet browser")));
+    return strncmp(section, "web", 3) == 0 &&
+           text_contains_case_insensitive(description, "browser");
 }
 
 static void add_catalog_package(const char *name, const char *version,
                                 const char *description,
-                                const char *section) {
+                                const char *section, const char *tags) {
     if (!name[0]) return;
     PackageCategory category = category_for_section(section);
-    if (is_browser_package(name, description, section)) {
+    if (is_browser_package(description, section, tags)) {
         category = CATEGORY_BROWSER;
     }
     pkg_add(name, version, description, PKG_STATE_NOT_INSTALLED, category,
             is_gnuchan_binary(name), 0, 0);
+}
+
+static void append_catalog_field(char *destination, size_t capacity,
+                                const char *value) {
+    size_t used = strlen(destination);
+    while (*value == ' ' || *value == '\t') value++;
+    size_t length = strcspn(value, "\r\n");
+    if (used && used + 1 < capacity) {
+        destination[used++] = ' ';
+        destination[used] = '\0';
+    }
+    if (length > capacity - used - 1) {
+        length = capacity - used - 1;
+    }
+    memcpy(destination + used, value, length);
+    destination[used + length] = '\0';
+}
+
+static void parse_available_catalog(FILE *fp) {
+    char line[LINE_BUF_LEN];
+    char name[MAX_NAME_LEN] = {0};
+    char version[MAX_VERSION_LEN] = {0};
+    char section[128] = {0};
+    char description[MAX_DESC_LEN] = {0};
+    char tags[MAX_TAGS_LEN] = {0};
+    enum { FIELD_NONE, FIELD_DESCRIPTION, FIELD_TAGS } field = FIELD_NONE;
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '\n' || line[0] == '\r') {
+            pthread_mutex_lock(&state_mutex);
+            add_catalog_package(name, version, description, section, tags);
+            pthread_mutex_unlock(&state_mutex);
+            name[0] = version[0] = section[0] = description[0] = '\0';
+            tags[0] = '\0';
+            field = FIELD_NONE;
+            continue;
+        }
+        if (field != FIELD_NONE && isspace((unsigned char)line[0])) {
+            append_catalog_field(field == FIELD_DESCRIPTION ? description : tags,
+                                 field == FIELD_DESCRIPTION ? sizeof(description)
+                                                            : sizeof(tags),
+                                 line);
+            continue;
+        }
+        field = FIELD_NONE;
+        if (strncmp(line, "Package: ", 9) == 0) {
+            snprintf(name, sizeof(name), "%.*s",
+                     (int)strcspn(line + 9, "\r\n"), line + 9);
+        } else if (strncmp(line, "Version: ", 9) == 0) {
+            snprintf(version, sizeof(version), "%.*s",
+                     (int)strcspn(line + 9, "\r\n"), line + 9);
+        } else if (strncmp(line, "Section: ", 9) == 0) {
+            snprintf(section, sizeof(section), "%.*s",
+                     (int)strcspn(line + 9, "\r\n"), line + 9);
+        } else if (strncmp(line, "Tag: ", 5) == 0) {
+            snprintf(tags, sizeof(tags), "%.*s",
+                     (int)strcspn(line + 5, "\r\n"), line + 5);
+            field = FIELD_TAGS;
+        } else if (strncmp(line, "Description: ", 13) == 0 ||
+                   strncmp(line, "Description-", 12) == 0) {
+            char *value = NULL;
+            if (strncmp(line, "Description: ", 13) == 0) {
+                value = line + 13;
+            } else {
+                char *colon = strchr(line + 12, ':');
+                if (colon && isalpha((unsigned char)line[12]) &&
+                    strncmp(line + 12, "md5", (size_t)(colon - (line + 12))) != 0) {
+                    value = colon + 1;
+                }
+            }
+            if (value) {
+                while (*value == ' ' || *value == '\t') value++;
+                snprintf(description, sizeof(description), "%.*s",
+                         (int)strcspn(value, "\r\n"), value);
+                field = FIELD_DESCRIPTION;
+            }
+        }
+    }
+    pthread_mutex_lock(&state_mutex);
+    add_catalog_package(name, version, description, section, tags);
+    pthread_mutex_unlock(&state_mutex);
 }
 
 static void load_available_packages(void) {
@@ -618,56 +791,7 @@ static void load_available_packages(void) {
         return;
     }
 
-    char line[LINE_BUF_LEN];
-    char name[MAX_NAME_LEN] = {0};
-    char version[MAX_VERSION_LEN] = {0};
-    char section[128] = {0};
-    char description[MAX_DESC_LEN] = {0};
-    int in_description = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (line[0] == '\n' || line[0] == '\r') {
-            pthread_mutex_lock(&state_mutex);
-            add_catalog_package(name, version, description, section);
-            pthread_mutex_unlock(&state_mutex);
-            name[0] = version[0] = section[0] = description[0] = '\0';
-            in_description = 0;
-            continue;
-        }
-        if (in_description && isspace((unsigned char)line[0])) {
-            char *text = line;
-            while (*text == ' ' || *text == '\t') text++;
-            size_t length = strcspn(text, "\r\n");
-            size_t used = strlen(description);
-            if (used && used + 1 < sizeof(description)) {
-                description[used++] = ' ';
-                description[used] = '\0';
-            }
-            if (length > sizeof(description) - used - 1) {
-                length = sizeof(description) - used - 1;
-            }
-            memcpy(description + used, text, length);
-            description[used + length] = '\0';
-            continue;
-        }
-        in_description = 0;
-        if (strncmp(line, "Package: ", 9) == 0) {
-            snprintf(name, sizeof(name), "%.*s",
-                     (int)strcspn(line + 9, "\r\n"), line + 9);
-        } else if (strncmp(line, "Version: ", 9) == 0) {
-            snprintf(version, sizeof(version), "%.*s",
-                     (int)strcspn(line + 9, "\r\n"), line + 9);
-        } else if (strncmp(line, "Section: ", 9) == 0) {
-            snprintf(section, sizeof(section), "%.*s",
-                     (int)strcspn(line + 9, "\r\n"), line + 9);
-        } else if (strncmp(line, "Description: ", 13) == 0) {
-            snprintf(description, sizeof(description), "%.*s",
-                     (int)strcspn(line + 13, "\r\n"), line + 13);
-            in_description = 1;
-        }
-    }
-    pthread_mutex_lock(&state_mutex);
-    add_catalog_package(name, version, description, section);
-    pthread_mutex_unlock(&state_mutex);
+    parse_available_catalog(fp);
     int rc = pclose(fp);
     if (!WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
         pthread_mutex_lock(&state_mutex);
@@ -719,11 +843,41 @@ static void load_installed_packages(void) {
 }
 
 /* Guncelleme denetimi: apt-get -s upgrade */
+static Package *find_apt_package(const char *name) {
+    Package *p = pkg_find(name);
+    if (p) return p;
+    const char *architecture = strchr(name, ':');
+    if (!architecture) return NULL;
+    char base_name[MAX_NAME_LEN];
+    size_t length = (size_t)(architecture - name);
+    if (length == 0 || length >= sizeof(base_name)) return NULL;
+    memcpy(base_name, name, length);
+    base_name[length] = '\0';
+    return pkg_find(base_name);
+}
+
+static void mark_apt_updates(FILE *fp) {
+    char line[LINE_BUF_LEN];
+    int count = 0;
+    pthread_mutex_lock(&state_mutex);
+    while (fgets(line, sizeof(line), fp)) {
+        char name[MAX_NAME_LEN] = {0};
+        if (sscanf(line, "Inst %255s", name) != 1) continue;
+        Package *p = find_apt_package(name);
+        if (p && !p->apt_update) {
+            p->apt_update = 1;
+            p->has_update = 1;
+            count++;
+        }
+    }
+    update_available = count;
+    state_revision++;
+    pthread_mutex_unlock(&state_mutex);
+}
+
 static void check_apt_updates(void) {
-    char cmd[CMD_BUF_LEN];
-    snprintf(cmd, sizeof(cmd), "apt-get -s upgrade 2>/dev/null | grep '^Inst' | head -50");
-    char out[CMD_BUF_LEN * 4];
-    if (run_cmd(cmd, out, sizeof(out)) != 0) {
+    FILE *fp = popen("apt-get -s upgrade 2>/dev/null", "r");
+    if (!fp) {
         pthread_mutex_lock(&state_mutex);
         set_status(center_text("Could not check apt updates",
                                "apt guncelleme denetimi calismadi"));
@@ -731,33 +885,50 @@ static void check_apt_updates(void) {
         return;
     }
 
-    int cnt = 0;
-    pthread_mutex_lock(&state_mutex);
-    char *line = out;
-    while (*line) {
-        char *end = strchr(line, '\n');
-        if (end) *end = '\0';
-        char pkg_name[MAX_NAME_LEN] = {0};
-        if (sscanf(line, "Inst %255s", pkg_name) == 1) {
-            Package *p = pkg_find(pkg_name);
-            if (p) {
-                p->has_update = 1;
-                cnt++;
-            }
-        }
-        if (end) line = end + 1;
-        else break;
+    mark_apt_updates(fp);
+    int rc = pclose(fp);
+    if (!WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
+        pthread_mutex_lock(&state_mutex);
+        set_status(center_text("Could not check apt updates",
+                               "apt guncelleme denetimi calismadi"));
+        pthread_mutex_unlock(&state_mutex);
     }
-    update_available = cnt;
-    state_revision++;
-    pthread_mutex_unlock(&state_mutex);
 }
 
 static int repo_config_exists(const char *home, const GnuchanRepo *repo) {
     char path[CONFIG_PATH_LEN];
-    snprintf(path, sizeof(path), "%s/.config/%s/%s", home,
-             repo->config_dir, repo->config_file);
-    return access(path, R_OK) == 0;
+    if (repo_config_path(home, repo, path, sizeof(path)) &&
+        access(path, R_OK) == 0) {
+        return 1;
+    }
+
+    char executable[CONFIG_PATH_LEN];
+    const char *fixed_dirs[] = {"/usr/local/bin", "/usr/bin", "/bin", NULL};
+    for (size_t i = 0; fixed_dirs[i]; i++) {
+        snprintf(executable, sizeof(executable), "%s/%s",
+                 fixed_dirs[i], repo->program);
+        if (access(executable, X_OK) == 0) return 1;
+    }
+
+    const char *path_env = getenv("PATH");
+    while (path_env && *path_env) {
+        const char *end = strchr(path_env, ':');
+        size_t directory_length = end ? (size_t)(end - path_env)
+                                      : strlen(path_env);
+        if (directory_length > 0 &&
+            directory_length + strlen(repo->program) + 2 <
+                sizeof(executable)) {
+            memcpy(executable, path_env, directory_length);
+            executable[directory_length] = '/';
+            snprintf(executable + directory_length + 1,
+                     sizeof(executable) - directory_length - 1, "%s",
+                     repo->program);
+            if (access(executable, X_OK) == 0) return 1;
+        }
+        if (!end) break;
+        path_env = end + 1;
+    }
+    return 0;
 }
 
 static void add_user_gnuchan_programs(const char *home) {
@@ -765,8 +936,8 @@ static void add_user_gnuchan_programs(const char *home) {
     for (size_t i = 0; i < GNUCHAN_REPO_COUNT; i++) {
         GnuchanRepo *repo = &gnuchan_repos[i];
         if (!repo_config_exists(home, repo)) continue;
-        read_config_version(home, repo->config_dir, repo->config_file,
-                            repo->local_version, sizeof(repo->local_version));
+        read_config_version(home, repo, repo->local_version,
+                            sizeof(repo->local_version));
         Package *pkg = pkg_find(repo->program);
         if (pkg) {
             pkg->state = PKG_STATE_INSTALLED;
@@ -798,8 +969,8 @@ static void check_github_versions(const char *home) {
         }
         checked++;
 
-        read_config_version(home, r->config_dir, r->config_file,
-                            r->local_version, sizeof(r->local_version));
+        read_config_version(home, r, r->local_version,
+                            sizeof(r->local_version));
 
         /* Uzak versiyonu GitHub'dan al */
         char url[512];
@@ -1094,9 +1265,10 @@ static SidebarItem sidebar_items[] = {
     {"Graphics", "Graphics", VIEW_GRAPHICS},
     {"Multimedia", "Multimedia", VIEW_MULTIMEDIA},
     {"Development", "Development", VIEW_DEVELOPMENT},
+    {"Education", "Egitim", VIEW_EDUCATION},
+    {"Science", "Bilim", VIEW_SCIENCE},
     {"Games", "Oyunlar", VIEW_GAMES},
     {"Browser", "Tarayicilar", VIEW_BROWSER},
-    {"Other", "Other", VIEW_OTHER},
 };
 static int sidebar_count =
     (int)(sizeof(sidebar_items) / sizeof(sidebar_items[0]));
@@ -1134,9 +1306,10 @@ static int view_matches(ViewId view, const Package *p) {
     case VIEW_GRAPHICS: return p->category == CATEGORY_GRAPHICS;
     case VIEW_MULTIMEDIA: return p->category == CATEGORY_MULTIMEDIA;
     case VIEW_DEVELOPMENT: return p->category == CATEGORY_DEVELOPMENT;
+    case VIEW_EDUCATION: return p->category == CATEGORY_EDUCATION;
+    case VIEW_SCIENCE: return p->category == CATEGORY_SCIENCE;
     case VIEW_GAMES: return p->category == CATEGORY_GAMES;
     case VIEW_BROWSER: return p->category == CATEGORY_BROWSER;
-    case VIEW_OTHER: return p->category == CATEGORY_OTHER;
     }
     return 0;
 }
